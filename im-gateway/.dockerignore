@@ -1,0 +1,11 @@
+vendor
+runtime
+composer.lock
+.env
+*.log
+.git
+.DS_Store
+.idea
+.vscode
+Dockerfile
+.dockerignore
