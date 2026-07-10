@@ -6,9 +6,10 @@
     "require": {
         "php": ">=8.1",
         "php-amqplib/php-amqplib": "^3.7",
+        "robmorgan/phinx": "^0.16.10",
         "workerman/gateway-worker": "^4.0",
         "vlucas/phpdotenv": "^5.6",
-        "b8im/im-shared": "*"
+        "b8im/im-shared": "^1.0"
     },
     "repositories": [
         { "type": "path", "url": "../../b8im-im-shared" }
@@ -17,6 +18,21 @@
         "psr-4": {
             "B8im\\ImBusiness\\": "src/"
         }
+    },
+    "scripts": {
+        "test": "php tests/run.php && php tests/realtime_delivery.php && php tests/tenant_im_policy_test.php && php tests/realtime_control_events.php && php tests/module_license_checker_test.php && php tests/message_shard_router_test.php && php tests/phinx_bootstrap_test.php",
+        "test-realtime": "php tests/realtime_delivery.php",
+        "test-realtime-control": "php tests/realtime_control_events.php",
+        "test-realtime-control-redis": "php tests/realtime_control_redis_integration.php",
+        "test-integration": "php tests/mysql_integration.php",
+        "test-private-asset-migration": "php tests/private_asset_migration_mysql_integration.php",
+        "test-websocket": "php tests/websocket_auth_smoke.php",
+        "lint": "find src tests ../database/migrations ../bin -name '*.php' -print0 | xargs -0 -n1 php -l",
+        "migrate": "phinx -c ../phinx.php migrate",
+        "migration-status": "phinx -c ../phinx.php status",
+        "rollback": "phinx -c ../phinx.php rollback",
+        "prebuild-shards": "php ../bin/prebuild_message_shards.php",
+        "assert-database-target": "php ../bin/assert_database_target.php"
     },
     "minimum-stability": "stable",
     "prefer-stable": true

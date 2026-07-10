@@ -21,12 +21,20 @@ final class OutboxPublisherProcess
     private ?RabbitMqPublisher $publisher = null;
     private bool $running = false;
 
+    private string $workerId = '';
+
     public function __construct(private readonly Config $config)
     {
     }
 
     public function start(): void
     {
+        $this->workerId = sprintf(
+            '%s:%d:%s',
+            substr((string) (gethostname() ?: 'unknown'), 0, 32),
+            getmypid() ?: 0,
+            bin2hex(random_bytes(6)),
+        );
         $repository = ImRepository::connect($this->config);
         $this->outbox = new OutboxService($repository, $this->config);
         $this->publisher = new RabbitMqPublisher($this->config);
@@ -43,7 +51,7 @@ final class OutboxPublisherProcess
 
         $this->running = true;
         try {
-            $rows = $this->outbox->claimPending($this->config->mqOutboxBatchSize);
+            $rows = $this->outbox->claimPending($this->config->mqOutboxBatchSize, $this->workerId);
             foreach ($rows as $row) {
                 $this->publishRow($row);
             }
@@ -59,17 +67,25 @@ final class OutboxPublisherProcess
     private function publishRow(array $row): void
     {
         $id = (int) $row['id'];
+        $claimToken = (string) ($row['claim_token'] ?? '');
         try {
-            $payload = json_decode((string) $row['payload'], true, flags: JSON_THROW_ON_ERROR);
+            if ($claimToken === '') {
+                throw new \RuntimeException('outbox row has no claim_token');
+            }
+            $payload = json_decode((string) $row['payload_json'], true, flags: JSON_THROW_ON_ERROR);
             if (!is_array($payload)) {
                 throw new \RuntimeException('outbox payload is not an object');
             }
 
             $messageId = 'im-outbox-' . $id . '-' . (string) $row['message_id'];
             $this->publisher?->publish((string) $row['routing_key'], $payload, $messageId);
-            $this->outbox?->markPublished($id);
+            $this->outbox?->markPublished($id, $claimToken);
         } catch (Throwable $throwable) {
-            $this->outbox?->markFailed($id, $throwable->getMessage());
+            try {
+                $this->outbox?->markFailed($id, $claimToken, $throwable->getMessage());
+            } catch (Throwable $claimException) {
+                echo date('Y-m-d H:i:s') . ' IM outbox claim result ignored: id=' . $id . ' ' . $claimException->getMessage() . "\n";
+            }
             echo date('Y-m-d H:i:s') . ' IM outbox publish failed: id=' . $id . ' ' . $throwable->getMessage() . "\n";
         }
     }

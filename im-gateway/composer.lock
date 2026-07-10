@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "ab86d5416795a9580c6419e21ddda378",
+    "content-hash": "863ac152b410518a262503efa55513a5",
     "packages": [
         {
             "name": "b8im/im-shared",
@@ -12,7 +12,7 @@
             "dist": {
                 "type": "path",
                 "url": "../../b8im-im-shared",
-                "reference": "1559f10e5ac3a82d6c9a1be24eeb563a6c3d7d7d"
+                "reference": "e7cd3e053e2b6032811425f58a541452d49a3a0c"
             },
             "require": {
                 "php": ">=8.1"
@@ -22,6 +22,14 @@
                 "psr-4": {
                     "B8im\\ImShared\\": "src/"
                 }
+            },
+            "scripts": {
+                "test": [
+                    "php tests/run.php"
+                ],
+                "lint": [
+                    "find src tests -name '*.php' -print0 | xargs -0 -n1 php -l"
+                ]
             },
             "license": [
                 "MIT"

@@ -12,8 +12,9 @@ use B8im\ImBusiness\Config;
 use PDO;
 use PDOException;
 use Throwable;
+use B8im\ImBusiness\Service\ModuleLicenseRepositoryInterface;
 
-final class ImRepository
+final class ImRepository implements MessageShardRepositoryInterface, ModuleLicenseRepositoryInterface
 {
     private PDO $pdo;
     private int $transactionDepth = 0;
@@ -92,6 +93,7 @@ final class ImRepository
 
     private function runTransaction(callable $callback, bool $allowRetry): mixed
     {
+        $commitStarted = false;
         try {
             $this->pdo->beginTransaction();
             $this->transactionDepth++;
@@ -100,6 +102,7 @@ final class ImRepository
             } finally {
                 $this->transactionDepth--;
             }
+            $commitStarted = true;
             $this->pdo->commit();
 
             return $result;
@@ -108,6 +111,16 @@ final class ImRepository
 
             if ($allowRetry && $throwable instanceof PDOException && $this->isConnectionLost($throwable)) {
                 $this->reconnect();
+
+                if ($commitStarted) {
+                    // The server may have committed even though the client did
+                    // not receive COMMIT OK. Replaying arbitrary callbacks can
+                    // duplicate edits/notices or turn success into a conflict.
+                    throw new \RuntimeException(
+                        'IM transaction commit outcome is unknown; retry with an operation id or SYNC state first.',
+                        previous: $throwable,
+                    );
+                }
 
                 return $this->runTransaction($callback, false);
             }

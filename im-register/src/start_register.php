@@ -11,14 +11,17 @@
 declare(strict_types=1);
 
 use GatewayWorker\Register;
+use B8im\ImShared\Support\RuntimeEnvironment;
 
 // 监听地址：Gateway 和 Business 都用这个地址来注册/发现。
 // 集群时所有节点指向同一个 Register。
-$registerListen = getenv('REGISTER_LISTEN') ?: 'text://0.0.0.0:1238';
+$registerListen = RuntimeEnvironment::value('REGISTER_LISTEN', 'text://127.0.0.1:1238');
 
 $register = new Register($registerListen);
 $register->name = 'ImRegister';
 
 // 内部通信密钥：必须与 Gateway / Business 的 SECRET_KEY 一致，否则拒绝注册。
 // 生产环境务必通过 .env 配置一个强随机值。
-$register->secretKey = getenv('SECRET_KEY') ?: '';
+$register->secretKey = RuntimeEnvironment::requireInternalSecret(
+    RuntimeEnvironment::value('SECRET_KEY'),
+);

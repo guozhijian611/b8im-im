@@ -81,8 +81,16 @@ final class TypingService
     private function conversationMembers(int $organization, string $conversationId): array
     {
         $rows = $this->repository->fetchAll(
-            'SELECT user_id FROM im_conversation_member
-              WHERE organization = ? AND conversation_id = ? AND status = 1 AND delete_time IS NULL',
+            'SELECT cm.user_id FROM im_conversation_member cm
+              INNER JOIN im_conversation c
+                 ON c.organization = cm.organization
+                AND c.conversation_id = cm.conversation_id
+                AND c.status = 1
+                AND c.delete_time IS NULL
+              WHERE cm.organization = ?
+                AND cm.conversation_id = ?
+                AND cm.status = 1
+                AND cm.delete_time IS NULL',
             [$organization, $conversationId],
         );
 

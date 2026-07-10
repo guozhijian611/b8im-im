@@ -41,7 +41,13 @@ final class RabbitMqPublisher
                 ]),
             ]);
 
-            $this->channel()->basic_publish($message, $this->config->rabbitmqExchange, $routingKey);
+            $this->channel()->basic_publish(
+                $message,
+                $this->config->rabbitmqExchange,
+                $routingKey,
+                true,
+            );
+            $this->channel()->wait_for_pending_acks_returns(5.0);
         } catch (Throwable $throwable) {
             $this->close();
             throw $throwable;
@@ -79,6 +85,24 @@ final class RabbitMqPublisher
         );
         $this->channel = $this->connection->channel();
         $this->declareTopology($this->channel);
+        $this->channel->set_nack_handler(static function (): never {
+            throw new \RuntimeException('RabbitMQ negatively acknowledged an outbox event.');
+        });
+        $this->channel->set_return_listener(static function (
+            int $replyCode,
+            string $replyText,
+            string $exchange,
+            string $routingKey,
+        ): never {
+            throw new \RuntimeException(sprintf(
+                'RabbitMQ returned an unroutable outbox event: %d %s %s/%s',
+                $replyCode,
+                $replyText,
+                $exchange,
+                $routingKey,
+            ));
+        });
+        $this->channel->confirm_select();
 
         return $this->channel;
     }
@@ -100,6 +124,10 @@ final class RabbitMqPublisher
         ]);
 
         $this->declareQueue($channel, Constants::MQ_MESSAGE_AFTER, Constants::MQ_ROUTING_MESSAGE_CREATED, $queueOptions);
+        $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_MESSAGE_RECALLED);
+        $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_MESSAGE_EDITED);
+        $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_MESSAGE_DELETED_BOTH);
+        $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_MESSAGE_DELETED_SELF);
         $this->declareQueue($channel, Constants::MQ_GROUP_FANOUT, Constants::MQ_ROUTING_GROUP_FANOUT, $queueOptions);
         $this->declareQueue($channel, Constants::MQ_OFFLINE_PUSH, Constants::MQ_ROUTING_OFFLINE_PUSH, $queueOptions);
         $this->declareQueue($channel, Constants::MQ_MESSAGE_AUDIT, Constants::MQ_ROUTING_MESSAGE_AUDIT, $queueOptions);

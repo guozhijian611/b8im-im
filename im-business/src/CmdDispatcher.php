@@ -70,7 +70,7 @@ final class CmdDispatcher
      *
      * 调用方需先用 has() 判断存在性。先执行 license guard，再执行 handler。
      */
-    public function dispatch(string $clientId, Packet $packet): void
+    public function dispatch(string $clientId, int $organization, Packet $packet): void
     {
         $entry = $this->registry[$packet->cmd] ?? null;
         if ($entry === null) {
@@ -78,9 +78,9 @@ final class CmdDispatcher
         }
 
         if ($entry['guard'] !== null) {
-            ($entry['guard'])($packet->organization);
+            ($entry['guard'])($organization);
         }
 
-        $entry['handler']->handle($clientId, $packet);
+        $entry['handler']->handle($clientId, $packet->withServerOrganization($organization));
     }
 }

@@ -40,6 +40,13 @@ DB_USER = root
 DB_PASSWORD = root
 ```
 
+三个进程统一使用 `IM_TIMEZONE=Asia/Shanghai`。`SECRET_KEY` 是 GatewayWorker
+内部传输信任根，必须三端一致、至少 32 字节且不能使用示例占位值；
+不符合时进程直接失败关闭。Register 默认只监听 `127.0.0.1:1238`，只有明确的
+多机私网部署才应改为其他地址。
+
+命令行显式传入的环境变量优先于 `.env`，因此可以安全使用临时数据库运行迁移和集成测试。
+
 ## Docker 构建
 
 Dockerfile 需要同时读取 `b8im-im/` 和 `b8im-im-shared/`，请在
@@ -50,3 +57,100 @@ docker build -f b8im-im/im-register/Dockerfile -t b8im/im-register .
 docker build -f b8im-im/im-gateway/Dockerfile -t b8im/im-gateway .
 docker build -f b8im-im/im-business/Dockerfile -t b8im/im-business .
 ```
+
+## IM 数据库迁移
+
+IM 表和消息分片由本仓库独立管理，不混入 Server migration。完整部署仍应先执行
+`b8im-server` migration，以提供机构、模块和租户授权等 IM 会读取的控制面表；随后执行：
+
+```bash
+cd im-business
+composer install
+composer migration-status
+composer migrate
+composer migration-status
+```
+
+回滚当前 IM migration：
+
+```bash
+cd im-business
+composer rollback
+```
+
+迁移会按首次部署的 `IM_MESSAGE_SHARD_BUCKETS` 创建当月和下月全部分片，并把桶数写入 `im_runtime_config` 作为不可变部署配置。运行时或预建任务发现环境变量与已迁移桶数不一致会失败关闭。跨月前由运维或定时任务执行：
+
+```bash
+cd im-business
+composer prebuild-shards
+```
+
+`im-business` 启动时只做 schema 与当月/下月分片预检。`SEND` / `ACK` / `SYNC` 请求路径绝不执行 `CREATE TABLE` / `ALTER TABLE`；分片缺失时失败关闭并返回 `IM_SHARD_NOT_PREBUILT`。
+
+本 migration 同时拥有第一阶段 Web/IM 真链路所需的用户凭证与资料、好友关系/申请、设备与登录 IP 审计、会话/群资料/成员历史可见周期、会话自定义分组、消息索引、变更流和 outbox 表。开发版只使用新字段口径，例如 `password_hash`、`member_role`、`conversation_remark`，不保留 `password`、`role`、`platform` 等旧字段别名。
+
+## 数据库集成测试隔离
+
+会执行 migration `down` 或写入测试数据的命令不得指向正在被其他服务使用的 `nb8im`。先创建独立临时库、导入 SaiMulti 基线并在该库执行 Server migration，再显式设置并断言目标库：
+
+```bash
+cd im-business
+DB_NAME=nb8im_im_test IM_EXPECT_DATABASE=nb8im_im_test composer assert-database-target
+DB_NAME=nb8im_im_test IM_EXPECT_DATABASE=nb8im_im_test composer migrate
+DB_NAME=nb8im_im_test IM_EXPECT_DATABASE=nb8im_im_test composer test-integration
+DB_NAME=nb8im_im_test IM_EXPECT_DATABASE=nb8im_im_test composer rollback
+```
+
+`assert-database-target` 会分别通过 Business PDO 和 Phinx PDO 执行 `SELECT DATABASE()`；任一连接不是 `IM_EXPECT_DATABASE` 都立即失败。MySQL/WebSocket 集成测试同样强制要求该变量，避免误写默认开发库。
+
+私有附件历史 URL 归一化迁移的契约测试必须使用名为
+`nb8im_private_asset_migration_<random>_test` 的独立库，先只迁移到
+`20260710030000`，再执行 `composer test-private-asset-migration`。该测试会写入
+URL-only 附件、嵌套合并转发和待重试 outbox，然后执行
+`20260710050000` 并验证旧 URL 全部清除。
+
+## AUTH 信任域
+
+- IM 只接受 HS256 JWT，`iss` 必须是 `IM_TOKEN_TRUSTED_ISSUERS` 中的稳定 `deployment_id`，`aud` 必须包含 `IM_TOKEN_AUDIENCE=im`。
+- token 必须包含非空 `deployment_id`、`exp`、`nbf`、`organization`、`user_id`、`device_id`、`client_id`、`session_id`、`client_family`、`os`；`deployment_id` 必须与 `iss` 一致。Web 唯一口径为 `client_family=web, os=browser`。
+- HTTP 控制面签发 token 前需在 `im_auth_session` 写入同一 credential session；IM AUTH 会重新校验机构、用户、设备和会话状态。
+- AUTH 后每条已鉴权 cmd 都会重验同一身份链路；仅把成功结果短暂缓存到 `im:auth:active:{organization}:{credential_session_id}`，最长由 `IM_AUTH_REVALIDATE_TTL_SECONDS` 控制。撤销会话时删除该 key 可立即失败关闭，未主动删除时也会在有界 TTL 内生效。
+- `im:events:realtime` 中的 session/device 撤销事件只会关闭 `organization + user + device + credential session` 与事件中已提供的 client/connection session 同时匹配的连接；机构停用先写 `im:auth:organization_inactive:{organization}` 强制阻断，再仅遍历关闭该机构的规范 session。缺字段、重复租户位置或旧格式事件直接丢弃，不猜测范围。
+- 鉴权成功后 BusinessWorker 生成独立 128-bit 连接 `session_id`，客户端帧里的 `organization` 不参与授权、路由或持久化。
+- `im_user_device` 保留当前设备/IP 快照；每次成功 AUTH 和断开都会写入或闭合 `im_user_login_audit`，旧连接断开使用 client/session compare-and-delete，不能清掉新连接。
+- 浏览器 WebSocket 握手 Origin 必须命中 `im-gateway/.env` 的 `IM_TRUSTED_ORIGINS`。原生 App/Desktop 可不携带 Origin，但仍必须通过 JWT 鉴权。
+
+## 租户 IM 运行策略
+
+- AUTH 从 `sm_tenant_im_policy` 校验客户端形态、帐号席位、同设备/跨设备登录策略和最大在线设备数；同账号并发 AUTH 使用 5 秒 Redis reservation 串行决策。
+- SEND 在写库前获取 Redis Lua QPS/并发租约，无论成功或异常都释放；策略、MySQL 或 Redis 不可用时失败关闭。
+- 撤回/编辑时间窗和撤回提醒只读 canonical `sm_tenant_im_policy`，不再从旧 `message_config` 口径取值。
+- `tenant.policy.changed` 先失效策略缓存，再仅断开当前 organization 的规范 session，客户端重连后必须重新通过策略决策。
+
+## 模块授权执行边界
+
+- 模块扩展 cmd 在执行 handler 前同时要求 `sm_module.status=ENABLED`、`sm_tenant_module_license.status=ENABLED`、授权未过期且 manifest 包含 `im` 平台；任何数据库或缓存异常都失败关闭。
+- Server 与 IM 共用无框架前缀的物理 Redis key `module_license:{organization}:{module_key}` 和 JSON 快照字段；缓存 TTL 最长 300 秒且不越过 `effective_until`。控制面提交后写入权威新快照，Redis 只接受单调递增的 `(module_lock_version, license version)`，提交前读到旧状态的迟到写入不能重新放开权限。
+
+## 消息同步
+
+- 用户级离线同步只接受十进制字符串 `after_global_seq`，返回字符串 `next_after_global_seq`。
+- 会话同步同时使用 `after_seq` 与 `after_change_seq`，分别返回 `messages_has_more` 与 `changes_has_more`。
+- 全局和会话消息读取都按 `im_conversation_membership_period` 的历史可见区间过滤，不以当前成员状态代替历史授权。
+- `edit`、`recall`、`delete_both`、`delete_self` 在修改主体的同一事务内写 `im_message_change` 和可靠 outbox；目标用户事件被过滤时扫描游标仍推进。
+- Outbox claim 绑定 `worker_id + claim_token + locked_until`；只有当前 claim 能写发布结果，RabbitMQ publisher confirm 成功后才置为已发布，过期 claim 可回收并按至少一次语义重投。
+- 图片/文件/语音/视频消息只接受 Server 签发的 `file_id`。Business 会以 `organization + user_id + file_id + kind` 回查 `im_upload_asset`，并用数据库中的 URL、MIME 和大小覆盖客户端内容，不接受任意外链。
+
+## RabbitMQ 实时投递
+
+`ImRealtimeDelivery` 是与 BusinessWorker 隔离的独立 Workerman 进程，消费 durable `im.message.after`。它只接受
+`message.created`、`message.recalled`、`message.edited`、`message.deleted_both` 和
+`message.deleted_self`，并且要求 JSON `event_type` 与 RabbitMQ routing key 一致。持久化消息事件
+不再由 BusinessWorker 直接向收件人二次广播：发起连接只收到请求 ACK，
+RabbitMQ 消费者是唯一实时业务事件投递路径。
+
+- created 的收件人取 payload 与当前活跃、且在原消息 `message_seq` 可见周期内成员的交集；普通发送事件同时投递给发送者的其他在线连接，但排除本次发起连接。
+- `deleted_self` 只发给 `target_user_id`，不会扩散给其他会话成员。
+- 独立进程显式设置 `Gateway::$registerAddress` 和内部密钥，先按 `organization:user_id` 查询当前 client，每个 Gateway 写入成功后在 Redis 记录 `event_id + client_id` 投递检查点，全部成功后才 ACK RabbitMQ。
+- 投递异常以 `organization + message_id + event_type + change_seq` 在 Redis 原子计数，超过 `MQ_REALTIME_MAX_RETRY` 后 reject 至既有 DLX/DLQ；坏 JSON、不支持的事件和 schema 冲突不会被静默 ACK。
+- packet 显式携带稳定 `event_id`、`message_seq` 和 `change_seq`，客户端必须以事件与序号幂等去重。RabbitMQ 仍是至少一次语义；进程恰好在 Gateway 写入成功后、检查点持久化前崩溃时仍可能重复，但不会因预先标记而丢失事件。

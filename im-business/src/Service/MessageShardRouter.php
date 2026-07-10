@@ -8,20 +8,47 @@ declare(strict_types=1);
 
 namespace B8im\ImBusiness\Service;
 
-use B8im\ImBusiness\Repository\ImRepository;
+use B8im\ImBusiness\Repository\MessageShardRepositoryInterface;
+use B8im\ImBusiness\Exception\ImException;
 use InvalidArgumentException;
 
 final class MessageShardRouter
 {
     private const BASE_TABLE = 'im_message';
     private const INDEX_TABLE = 'im_message_index';
+    private const REQUIRED_RUNTIME_TABLES = [
+        'im_runtime_config',
+        'im_user',
+        'im_user_profile',
+        'im_user_privacy_setting',
+        'im_user_security_policy',
+        'im_friend_relation',
+        'im_friend_request',
+        'im_user_device',
+        'im_user_login_audit',
+        'im_web_access_session',
+        'im_auth_session',
+        'im_upload_asset',
+        'im_conversation',
+        'im_group_profile',
+        'im_conversation_member',
+        'im_message_group',
+        'im_conversation_membership_period',
+        'im_organization_message_sequence',
+        'im_message_index',
+        'im_message_receipt',
+        'im_message_user_delete',
+        'im_message_change',
+        'im_message_outbox',
+        'sm_tenant_im_policy',
+    ];
 
     private array $tableCache = [];
-    private array $ensuredTables = [];
-    private bool $indexEnsured = false;
+    private array $verifiedTables = [];
+    private bool $indexVerified = false;
 
     public function __construct(
-        private readonly ImRepository $repository,
+        private readonly MessageShardRepositoryInterface $repository,
         private readonly int $bucketCount,
     )
     {
@@ -31,7 +58,7 @@ final class MessageShardRouter
     {
         $timestamp = strtotime($time) ?: time();
         $table = sprintf('%s_%04d_%s', self::BASE_TABLE, $this->bucket($organization, $conversationId), date('Ym', $timestamp));
-        $this->ensureTable($table);
+        $this->assertTableExists($table);
 
         return $table;
     }
@@ -84,28 +111,56 @@ final class MessageShardRouter
         return self::INDEX_TABLE;
     }
 
-    public function ensureIndexTable(): void
+    public function assertIndexTableReady(): void
     {
-        if ($this->indexEnsured) {
+        if ($this->indexVerified) {
             return;
         }
 
-        $this->repository->execute(<<<'SQL'
-CREATE TABLE IF NOT EXISTS `im_message_index` (
-  `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
-  `organization` int(11) UNSIGNED NOT NULL COMMENT '机构编号',
-  `conversation_id` varchar(64) NOT NULL COMMENT '会话ID',
-  `message_id` varchar(40) NOT NULL COMMENT '消息ID',
-  `message_seq` bigint(20) UNSIGNED NOT NULL DEFAULT 0 COMMENT '会话内消息序号',
-  `shard_table` varchar(64) NOT NULL COMMENT '消息分片表',
-  `create_time` datetime NULL DEFAULT NULL COMMENT '创建时间',
-  PRIMARY KEY (`id`) USING BTREE,
-  UNIQUE KEY `uni_message` (`organization`, `message_id`) USING BTREE,
-  KEY `idx_conversation_seq` (`organization`, `conversation_id`, `message_seq`) USING BTREE,
-  KEY `idx_shard_table` (`shard_table`) USING BTREE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='IM消息分片索引表' ROW_FORMAT=DYNAMIC
-SQL);
-        $this->indexEnsured = true;
+        if (!$this->tableExists(self::INDEX_TABLE)) {
+            throw new ImException('IM 消息索引表未迁移，拒绝在请求路径建表', 'IM_SCHEMA_NOT_READY');
+        }
+        $this->indexVerified = true;
+    }
+
+    /**
+     * Worker 启动时预检当月和下月所有分片，不得把 DDL 推迟到 SEND 请求。
+     */
+    public function preflight(): void
+    {
+        foreach (self::REQUIRED_RUNTIME_TABLES as $table) {
+            if (!$this->tableExists($table)) {
+                throw new ImException('IM 运行时表未迁移: ' . $table, 'IM_SCHEMA_NOT_READY');
+            }
+        }
+        if (!$this->tableExists(self::BASE_TABLE)) {
+            throw new ImException('IM 消息模板表未迁移: ' . self::BASE_TABLE, 'IM_SCHEMA_NOT_READY');
+        }
+        $configuredBuckets = $this->repository->fetchOne(
+            'SELECT config_value FROM im_runtime_config
+              WHERE config_key = ? LIMIT 1',
+            ['message_shard_buckets'],
+        );
+        if (
+            $configuredBuckets === null
+            || (int) $configuredBuckets['config_value'] !== $this->bucketCount
+        ) {
+            throw new ImException(
+                'IM_MESSAGE_SHARD_BUCKETS 与已迁移部署配置不一致',
+                'IM_SHARD_BUCKET_CONFIG_MISMATCH',
+            );
+        }
+        $this->indexVerified = true;
+
+        foreach ([date('Ym'), date('Ym', strtotime('first day of next month'))] as $month) {
+            for ($bucket = 0; $bucket < $this->bucketCount; $bucket++) {
+                $table = sprintf('%s_%04d_%s', self::BASE_TABLE, $bucket, $month);
+                if (!$this->tableExists($table)) {
+                    throw new ImException('IM 消息分片未预建: ' . $table, 'IM_SHARD_NOT_PREBUILT');
+                }
+                $this->verifiedTables[$table] = true;
+            }
+        }
     }
 
     public function quote(string $table): string
@@ -117,15 +172,31 @@ SQL);
         return '`' . $table . '`';
     }
 
-    private function ensureTable(string $table): void
+    private function assertTableExists(string $table): void
     {
-        if (isset($this->ensuredTables[$table])) {
+        if (isset($this->verifiedTables[$table])) {
             return;
         }
 
-        $this->repository->execute('CREATE TABLE IF NOT EXISTS ' . $this->quote($table) . ' LIKE `' . self::BASE_TABLE . '`');
-        $this->ensuredTables[$table] = true;
-        $this->tableCache = [];
+        if (!$this->tableExists($table)) {
+            throw new ImException('IM 消息分片未预建: ' . $table, 'IM_SHARD_NOT_PREBUILT');
+        }
+        $this->verifiedTables[$table] = true;
+    }
+
+    private function tableExists(string $table): bool
+    {
+        if (preg_match('/^(?:im|sm)_[a-z0-9_]+$/', $table) !== 1) {
+            throw new InvalidArgumentException('invalid IM table');
+        }
+
+        return $this->repository->fetchOne(
+            'SELECT 1 AS present
+               FROM information_schema.TABLES
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+              LIMIT 1',
+            [$table],
+        ) !== null;
     }
 
     private function isMessageTable(string $table): bool

@@ -8,6 +8,9 @@ declare(strict_types=1);
 
 namespace B8im\ImBusiness;
 
+use B8im\ImBusiness\Auth\TokenPolicy;
+use B8im\ImShared\Support\RuntimeEnvironment;
+
 final class Config
 {
     public function __construct(
@@ -34,18 +37,30 @@ final class Config
         public readonly int $mqOutboxMaxRetry,
         public readonly int $mqOutboxRetryDelaySeconds,
         public readonly int $mqOutboxLockTtlSeconds,
+        public readonly bool $mqRealtimeEnabled,
+        public readonly int $mqRealtimeProcessCount,
+        public readonly int $mqRealtimePrefetch,
+        public readonly int $mqRealtimePollIntervalMs,
+        public readonly int $mqRealtimeMaxRetry,
+        public readonly int $mqRealtimeRetryTtlSeconds,
         public readonly string $imTokenSecret,
-        public readonly bool $allowInsecureToken,
+        public readonly array $imTokenTrustedIssuers,
+        public readonly string $imTokenAudience,
+        public readonly int $imTokenClockSkewSeconds,
         public readonly int $connectionTtl,
-        public readonly int $recallWindowSeconds,
-        public readonly int $editWindowSeconds,
         public readonly int $syncMaxLimit,
         public readonly int $messageShardBuckets,
+        public readonly int $moduleLicenseCacheTtlSeconds,
+        public readonly int $authRevalidateTtlSeconds,
     ) {
     }
 
     public static function fromEnv(): self
     {
+        RuntimeEnvironment::configureTimezone(
+            self::env('IM_TIMEZONE', RuntimeEnvironment::DEFAULT_TIMEZONE),
+        );
+
         return new self(
             dbHost: self::env('DB_HOST', '127.0.0.1'),
             dbPort: (int) self::env('DB_PORT', '3306'),
@@ -70,24 +85,37 @@ final class Config
             mqOutboxMaxRetry: max(1, (int) self::env('MQ_OUTBOX_MAX_RETRY', '10')),
             mqOutboxRetryDelaySeconds: max(1, (int) self::env('MQ_OUTBOX_RETRY_DELAY_SECONDS', '30')),
             mqOutboxLockTtlSeconds: max(10, (int) self::env('MQ_OUTBOX_LOCK_TTL_SECONDS', '60')),
+            mqRealtimeEnabled: self::boolEnv('MQ_REALTIME_ENABLED', true),
+            mqRealtimeProcessCount: max(0, (int) self::env('MQ_REALTIME_PROCESS_COUNT', '1')),
+            mqRealtimePrefetch: min(500, max(1, (int) self::env('MQ_REALTIME_PREFETCH', '50'))),
+            mqRealtimePollIntervalMs: min(1000, max(10, (int) self::env('MQ_REALTIME_POLL_INTERVAL_MS', '50'))),
+            mqRealtimeMaxRetry: min(100, max(1, (int) self::env('MQ_REALTIME_MAX_RETRY', '5'))),
+            mqRealtimeRetryTtlSeconds: max(60, (int) self::env('MQ_REALTIME_RETRY_TTL_SECONDS', '86400')),
             imTokenSecret: self::env('IM_TOKEN_SECRET', ''),
-            allowInsecureToken: self::boolEnv('IM_TOKEN_ALLOW_INSECURE', false),
+            imTokenTrustedIssuers: self::listEnv('IM_TOKEN_TRUSTED_ISSUERS'),
+            imTokenAudience: self::env('IM_TOKEN_AUDIENCE', 'im'),
+            imTokenClockSkewSeconds: min(300, max(0, (int) self::env('IM_TOKEN_CLOCK_SKEW_SECONDS', '30'))),
             connectionTtl: (int) self::env('IM_CONNECTION_TTL', (string) (86400 * 7)),
-            recallWindowSeconds: (int) self::env('IM_RECALL_WINDOW_SECONDS', '120'),
-            editWindowSeconds: (int) self::env('IM_EDIT_WINDOW_SECONDS', self::env('IM_RECALL_WINDOW_SECONDS', '120')),
             syncMaxLimit: (int) self::env('IM_SYNC_MAX_LIMIT', '100'),
             messageShardBuckets: min(1024, max(1, (int) self::env('IM_MESSAGE_SHARD_BUCKETS', '64'))),
+            moduleLicenseCacheTtlSeconds: min(300, max(1, (int) self::env('IM_MODULE_LICENSE_CACHE_TTL_SECONDS', '60'))),
+            authRevalidateTtlSeconds: min(30, max(1, (int) self::env('IM_AUTH_REVALIDATE_TTL_SECONDS', '3'))),
+        );
+    }
+
+    public function tokenPolicy(): TokenPolicy
+    {
+        return new TokenPolicy(
+            secret: $this->imTokenSecret,
+            trustedIssuers: $this->imTokenTrustedIssuers,
+            audience: $this->imTokenAudience,
+            clockSkewSeconds: $this->imTokenClockSkewSeconds,
         );
     }
 
     private static function env(string $key, string $default): string
     {
-        $value = $_ENV[$key] ?? $_SERVER[$key] ?? getenv($key);
-        if ($value === false || $value === null) {
-            return $default;
-        }
-
-        return trim((string) $value);
+        return RuntimeEnvironment::value($key, $default) ?? $default;
     }
 
     private static function boolEnv(string $key, bool $default): bool
@@ -95,5 +123,16 @@ final class Config
         $value = self::env($key, $default ? 'true' : 'false');
 
         return in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function listEnv(string $key): array
+    {
+        return array_values(array_unique(array_filter(
+            array_map('trim', explode(',', self::env($key, ''))),
+            static fn (string $value): bool => $value !== '',
+        )));
     }
 }

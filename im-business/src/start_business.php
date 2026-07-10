@@ -14,16 +14,19 @@ declare(strict_types=1);
 
 use GatewayWorker\BusinessWorker;
 use B8im\ImBusiness\Events;
+use B8im\ImShared\Support\RuntimeEnvironment;
 
 $worker = new BusinessWorker();
 $worker->name = 'ImBusiness';
-$worker->count = (int) (getenv('BUSINESS_PROCESS_COUNT') ?: 4);
+$worker->count = (int) RuntimeEnvironment::value('BUSINESS_PROCESS_COUNT', '4');
 
 // 指向 RegisterWorker（im-register），与 Gateway 用同一个。
-$worker->registerAddress = getenv('REGISTER_ADDRESS') ?: '127.0.0.1:1238';
+$worker->registerAddress = RuntimeEnvironment::value('REGISTER_ADDRESS', '127.0.0.1:1238');
 
 // 内部通信密钥，必须与 im-register / im-gateway 一致。
-$worker->secretKey = getenv('SECRET_KEY') ?: '';
+$worker->secretKey = RuntimeEnvironment::requireInternalSecret(
+    RuntimeEnvironment::value('SECRET_KEY'),
+);
 
 // 指定事件处理类。gateway-worker 4.x 支持用 eventHandler 指向一个类。
 $worker->eventHandler = Events::class;

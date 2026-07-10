@@ -9,7 +9,9 @@ declare(strict_types=1);
 namespace B8im\ImBusiness;
 
 use GatewayWorker\Lib\Gateway;
+use GatewayWorker\Lib\Context;
 use B8im\ImBusiness\Auth\AuthContext;
+use B8im\ImBusiness\Auth\ConnectionFailurePolicy;
 use B8im\ImBusiness\Auth\SessionResolver;
 use B8im\ImBusiness\Exception\ImException;
 use B8im\ImShared\Protocol\Packet;
@@ -79,10 +81,29 @@ class Events
                 default => self::handleModuleCmd($clientId, $packet),
             };
         } catch (ImException $exception) {
-            self::sendError($clientId, $exception->errorCode(), $exception->getMessage(), $packet->organization, $packet->clientMsgId);
+            $errorCode = $exception->errorCode();
+            self::sendError(
+                $clientId,
+                $errorCode,
+                $exception->getMessage(),
+                self::responseOrganization($clientId),
+                $packet->clientMsgId,
+            );
+            if (ConnectionFailurePolicy::shouldClose($packet->cmd, $errorCode)) {
+                Gateway::closeClient($clientId);
+            }
         } catch (\Throwable $throwable) {
             echo date('Y-m-d H:i:s') . ' IM error: ' . $throwable->getMessage() . "\n";
-            self::sendError($clientId, 'SERVER_ERROR', 'server error', $packet->organization, $packet->clientMsgId);
+            self::sendError(
+                $clientId,
+                'SERVER_ERROR',
+                'server error',
+                self::responseOrganization($clientId),
+                $packet->clientMsgId,
+            );
+            if ($packet->cmd === Command::AUTH) {
+                Gateway::closeClient($clientId);
+            }
         }
     }
 
@@ -105,13 +126,36 @@ class Events
 
     private static function handleAuth(string $clientId, Packet $packet): void
     {
-        $token = (string) ($packet->data['token'] ?? '');
-        $context = Runtime::token()->verify($token, $packet->organization, $packet->data);
+        $existingSession = Gateway::getSession($clientId);
+        if (is_array($existingSession) && !empty($existingSession['session_id'])) {
+            throw new ImException('当前连接已完成鉴权', 'AUTH_ALREADY_COMPLETED');
+        }
 
-        Gateway::bindUid($clientId, $context->uid());
-        Gateway::setSession($clientId, $context->toArray());
-        Runtime::connections()->bind($clientId, $context);
-        Runtime::devices()->online($context, $clientId);
+        $token = (string) ($packet->data['token'] ?? '');
+        $context = Runtime::token()->verify($token, $clientId);
+        Runtime::authIdentities()->assertActive($context);
+        $context = $context->withSessionId(bin2hex(random_bytes(16)));
+
+        $decision = Runtime::tenantImPolicies()->authorizeAuth($context);
+
+        try {
+            foreach ($decision->clientIdsToDisconnect as $oldClientId) {
+                if ($oldClientId !== '' && $oldClientId !== $clientId) {
+                    Gateway::closeClient($oldClientId);
+                }
+            }
+            $clientIp = long2ip((int) Context::$client_ip) ?: '';
+            Runtime::devices()->online($context, $clientIp);
+            Runtime::connections()->bind($clientId, $context);
+            Gateway::bindUid($clientId, $context->uid());
+            Gateway::setSession($clientId, $context->toArray());
+        } catch (\Throwable $throwable) {
+            Runtime::connections()->unbind($clientId);
+            Runtime::devices()->offline($context->toArray());
+            throw $throwable;
+        } finally {
+            $decision->release();
+        }
 
         Gateway::sendToClient(
             $clientId,
@@ -119,6 +163,14 @@ class Events
                 'ok' => true,
                 'user_id' => $context->userId,
                 'device_id' => $context->deviceId,
+                'client_id' => $context->clientId,
+                'session_id' => $context->sessionId,
+                'credential_session_id' => $context->credentialSessionId,
+                'client_family' => $context->clientFamily,
+                'os' => $context->os,
+                'issuer' => $context->issuer,
+                'audience' => $context->audience,
+                'not_before' => $context->notBefore,
                 'expire_at' => $context->expireAt,
             ], $context->organization)->encode()
         );
@@ -126,33 +178,39 @@ class Events
 
     private static function handlePing(string $clientId, Packet $packet): void
     {
+        $context = self::requireContext($clientId);
         Runtime::connections()->touch($clientId);
-        Gateway::sendToClient($clientId, Packet::make(Command::PONG, [], $packet->organization)->encode());
+        Gateway::sendToClient($clientId, Packet::make(Command::PONG, [], $context->organization)->encode());
     }
 
     private static function handleSend(string $clientId, Packet $packet): void
     {
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->send($context, $packet);
+        $permit = Runtime::tenantImPolicies()->acquireSendPermit(
+            $context->organization,
+            $context->userId,
+            $context->clientFamily,
+        );
+        try {
+            $result = Runtime::messages()->send($context, $packet->withServerOrganization($context->organization));
+        } finally {
+            $permit->release();
+        }
 
         Gateway::sendToClient(
             $clientId,
             Packet::make(Command::SEND_ACK, [
                 'ok' => true,
                 'duplicated' => $result['duplicated'],
+                'organization' => $context->organization,
+                'conversation_id' => $result['message']['conversation_id'],
+                'message_id' => $result['message']['message_id'],
+                'message_seq' => $result['message']['message_seq'],
+                'global_seq' => $result['message']['global_seq'],
+                'client_msg_id' => $result['message']['client_msg_id'],
                 'message' => $result['message'],
             ], $context->organization, $packet->clientMsgId)->encode()
         );
-
-        if ($result['duplicated']) {
-            return;
-        }
-
-        $push = Packet::make(Command::PUSH, ['message' => $result['message']], $context->organization)->encode();
-        foreach ($result['recipient_user_ids'] as $userId) {
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, (string) $userId), $push);
-        }
-        self::sendToOtherUserClients($context, $clientId, $push);
     }
 
     private static function handleAck(string $clientId, Packet $packet): void
@@ -174,24 +232,6 @@ class Events
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->recall($context, $packet->data);
         Gateway::sendToClient($clientId, Packet::make(Command::RECALL_ACK, $result, $context->organization)->encode());
-
-        $payload = Packet::make(Command::RECALL, [
-            'message_id' => $result['message_id'],
-            'conversation_id' => $result['conversation_id'],
-            'notice_message' => $result['notice_message'] ?? null,
-            'last_message_id' => $result['last_message_id'] ?? '',
-            'last_message_seq' => $result['last_message_seq'] ?? 0,
-            'last_message_time' => $result['last_message_time'] ?? '',
-            'last_message_summary' => $result['last_message_summary'] ?? '',
-            'time' => $result['time'] ?? date('Y-m-d H:i:s'),
-        ], $context->organization)->encode();
-        foreach ($result['recipient_user_ids'] as $userId) {
-            if ((string) $userId === $context->userId) {
-                continue;
-            }
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, (string) $userId), $payload);
-        }
-        self::sendToOtherUserClients($context, $clientId, $payload);
     }
 
     private static function handleEdit(string $clientId, Packet $packet): void
@@ -199,24 +239,6 @@ class Events
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->edit($context, $packet->data);
         Gateway::sendToClient($clientId, Packet::make(Command::EDIT_ACK, $result, $context->organization)->encode());
-
-        $payload = Packet::make(Command::EDIT, [
-            'message_id' => $result['message_id'],
-            'conversation_id' => $result['conversation_id'],
-            'message' => $result['message'],
-            'last_message_id' => $result['last_message_id'] ?? '',
-            'last_message_seq' => $result['last_message_seq'] ?? 0,
-            'last_message_time' => $result['last_message_time'] ?? '',
-            'last_message_summary' => $result['last_message_summary'] ?? '',
-            'time' => $result['time'] ?? date('Y-m-d H:i:s'),
-        ], $context->organization)->encode();
-        foreach ($result['recipient_user_ids'] as $userId) {
-            if ((string) $userId === $context->userId) {
-                continue;
-            }
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, (string) $userId), $payload);
-        }
-        self::sendToOtherUserClients($context, $clientId, $payload);
     }
 
     private static function handleDelete(string $clientId, Packet $packet): void
@@ -224,25 +246,6 @@ class Events
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->delete($context, $packet->data);
         Gateway::sendToClient($clientId, Packet::make(Command::DELETE_ACK, $result, $context->organization)->encode());
-
-        $payload = Packet::make(Command::DELETE, [
-            'message_id' => $result['message_id'],
-            'conversation_id' => $result['conversation_id'],
-            'scope' => $result['scope'],
-            'last_message_id' => $result['last_message_id'] ?? '',
-            'last_message_seq' => $result['last_message_seq'] ?? 0,
-            'last_message_time' => $result['last_message_time'] ?? '',
-            'last_message_summary' => $result['last_message_summary'] ?? '',
-            'time' => $result['time'] ?? date('Y-m-d H:i:s'),
-        ], $context->organization)->encode();
-
-        foreach ($result['recipient_user_ids'] as $userId) {
-            if ((string) $userId === $context->userId) {
-                continue;
-            }
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, (string) $userId), $payload);
-        }
-        self::sendToOtherUserClients($context, $clientId, $payload);
     }
 
     private static function handleScreenshot(string $clientId, Packet $packet): void
@@ -250,26 +253,6 @@ class Events
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->screenshot($context, $packet->data);
         Gateway::sendToClient($clientId, Packet::make(Command::SCREENSHOT_ACK, $result, $context->organization)->encode());
-        if (empty($result['enabled']) || empty($result['notice_message'])) {
-            return;
-        }
-
-        $payload = Packet::make(Command::SCREENSHOT, [
-            'conversation_id' => $result['conversation_id'],
-            'notice_message' => $result['notice_message'],
-            'last_message_id' => $result['last_message_id'] ?? '',
-            'last_message_seq' => $result['last_message_seq'] ?? 0,
-            'last_message_time' => $result['last_message_time'] ?? '',
-            'last_message_summary' => $result['last_message_summary'] ?? '',
-            'time' => $result['time'] ?? date('Y-m-d H:i:s'),
-        ], $context->organization)->encode();
-        foreach ($result['recipient_user_ids'] as $userId) {
-            if ((string) $userId === $context->userId) {
-                continue;
-            }
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, (string) $userId), $payload);
-        }
-        self::sendToOtherUserClients($context, $clientId, $payload);
     }
 
     private static function handleSync(string $clientId, Packet $packet): void
@@ -322,12 +305,13 @@ class Events
      */
     private static function handleModuleCmd(string $clientId, Packet $packet): void
     {
+        $context = self::requireContext($clientId);
         if (!Runtime::cmdDispatcher()->has($packet->cmd)) {
-            self::sendError($clientId, 'CMD_UNKNOWN', 'unknown cmd', $packet->organization, $packet->clientMsgId);
+            self::sendError($clientId, 'CMD_UNKNOWN', 'unknown cmd', $context->organization, $packet->clientMsgId);
             return;
         }
 
-        Runtime::cmdDispatcher()->dispatch($clientId, $packet);
+        Runtime::cmdDispatcher()->dispatch($clientId, $context->organization, $packet);
     }
 
     private static function startRealtimeEventConsumer(): void
@@ -343,16 +327,19 @@ class Events
 
     private static function requireContext(string $clientId): AuthContext
     {
-        return SessionResolver::mustResolve($clientId);
+        $context = SessionResolver::mustResolve($clientId);
+        Runtime::activeSessions()->assertActive($context);
+        Runtime::tenantImPolicies()->assertConnectionAllowed($context->organization, $context->clientFamily);
+
+        return $context;
     }
 
-    private static function sendToOtherUserClients(AuthContext $context, string $currentClientId, string $payload): void
+    private static function responseOrganization(string $clientId): int
     {
-        $clientIds = Gateway::getClientIdByUid($context->uid());
-        foreach ($clientIds as $clientId) {
-            if ($clientId !== $currentClientId) {
-                Gateway::sendToClient($clientId, $payload);
-            }
+        try {
+            return self::requireContext($clientId)->organization;
+        } catch (\Throwable) {
+            return 0;
         }
     }
 

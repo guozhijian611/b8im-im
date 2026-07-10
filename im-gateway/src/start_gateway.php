@@ -13,30 +13,50 @@
 declare(strict_types=1);
 
 use GatewayWorker\Gateway;
+use B8im\ImGateway\Security\OriginPolicy;
+use B8im\ImShared\Support\RuntimeEnvironment;
 
 // 对外 WebSocket 监听地址，App/Web 连这里。
-$wsListen = getenv('GATEWAY_LISTEN') ?: 'websocket://0.0.0.0:8787';
+$wsListen = RuntimeEnvironment::value('GATEWAY_LISTEN', 'websocket://0.0.0.0:8787');
 
 $gateway = new Gateway($wsListen);
 $gateway->name = 'ImGateway';
-$gateway->count = (int) (getenv('GATEWAY_PROCESS_COUNT') ?: 4);
+$gateway->count = (int) RuntimeEnvironment::value('GATEWAY_PROCESS_COUNT', '4');
 
 // 本机对内通信端口（供 BusinessWorker 连接）。多机部署时必须是内网可达 IP。
-$gateway->lanIp = getenv('GATEWAY_LAN_IP') ?: '127.0.0.1';
-$gateway->startPort = (int) (getenv('GATEWAY_START_PORT') ?: 2900);
+$gateway->lanIp = RuntimeEnvironment::value('GATEWAY_LAN_IP', '127.0.0.1');
+$gateway->startPort = (int) RuntimeEnvironment::value('GATEWAY_START_PORT', '2900');
 
 // 指向 RegisterWorker（im-register），集群所有节点共用同一个。
-$gateway->registerAddress = getenv('REGISTER_ADDRESS') ?: '127.0.0.1:1238';
+$gateway->registerAddress = RuntimeEnvironment::value('REGISTER_ADDRESS', '127.0.0.1:1238');
 
 // 内部通信密钥，必须与 im-register / im-business 一致。
-$gateway->secretKey = getenv('SECRET_KEY') ?: '';
+$gateway->secretKey = RuntimeEnvironment::requireInternalSecret(
+    RuntimeEnvironment::value('SECRET_KEY'),
+);
 
 // 心跳：超过该秒数未收到客户端数据则断开（readme §6.2 心跳保活）。
-$gateway->pingInterval = (int) (getenv('PING_INTERVAL') ?: 55);
+$gateway->pingInterval = (int) RuntimeEnvironment::value('PING_INTERVAL', '55');
 $gateway->pingNotResponseLimit = 1;
 // 空字符串表示由客户端主动发心跳；服务端只做超时检测。
 $gateway->pingData = '';
 
-// TODO（后续）：
-//  - onConnect 时可在此层做连接数限流 / 黑名单 IP 拦截。
-//  - 鉴权由 BusinessWorker 收到 AUTH 帧后用 IM token 校验并 bindUid。
+$originPolicy = OriginPolicy::fromCsv((string) RuntimeEnvironment::value('IM_TRUSTED_ORIGINS', ''));
+$gateway->onConnect = static function ($connection) use ($originPolicy): void {
+    $connection->onWebSocketConnect = static function ($connection, $request) use ($originPolicy): void {
+        $origin = is_object($request) && method_exists($request, 'header')
+            ? $request->header('origin')
+            : null;
+
+        try {
+            $originPolicy->assertAllowed(is_string($origin) ? $origin : null);
+        } catch (\InvalidArgumentException) {
+            $connection->close(
+                "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                true,
+            );
+        }
+    };
+};
+
+// 无 Origin 的原生客户端不在 Gateway 被拒绝，但 BusinessWorker 仍会强制校验 IM JWT。
