@@ -74,9 +74,9 @@ final class ImToken
 
     private function contextFromPayload(array $payload, int $packetOrganization, array $authData, bool $checkExpire = true): AuthContext
     {
-        $organization = (int) ($payload['organization'] ?? $payload['tenant_id'] ?? 0);
-        $userId = trim((string) ($payload['user_id'] ?? $payload['uid'] ?? ''));
-        $expireAt = (int) ($payload['exp'] ?? $payload['expire_at'] ?? 0);
+        $organization = (int) ($payload['organization'] ?? 0);
+        $userId = trim((string) ($payload['user_id'] ?? ''));
+        $expireAt = (int) ($payload['exp'] ?? 0);
 
         if ($organization <= 0 || $userId === '') {
             throw new ImException('IM token 缺少 organization 或 user_id', 'AUTH_TOKEN_IDENTITY');

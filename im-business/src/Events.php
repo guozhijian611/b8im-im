@@ -10,6 +10,7 @@ namespace B8im\ImBusiness;
 
 use GatewayWorker\Lib\Gateway;
 use B8im\ImBusiness\Auth\AuthContext;
+use B8im\ImBusiness\Auth\SessionResolver;
 use B8im\ImBusiness\Exception\ImException;
 use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Protocol\Command;
@@ -72,7 +73,10 @@ class Events
                 Command::DELETE => self::handleDelete($clientId, $packet),
                 Command::SCREENSHOT => self::handleScreenshot($clientId, $packet),
                 Command::SYNC => self::handleSync($clientId, $packet),
-                default => self::sendError($clientId, 'CMD_UNKNOWN', 'unknown cmd', $packet->organization, $packet->clientMsgId),
+                Command::TYPING => self::handleTyping($clientId, $packet),
+                Command::PRESENCE => self::handlePresence($clientId, $packet),
+                Command::CONVERSATION_READ => self::handleConversationRead($clientId, $packet),
+                default => self::handleModuleCmd($clientId, $packet),
             };
         } catch (ImException $exception) {
             self::sendError($clientId, $exception->errorCode(), $exception->getMessage(), $packet->organization, $packet->clientMsgId);
@@ -275,6 +279,57 @@ class Events
         Gateway::sendToClient($clientId, Packet::make(Command::SYNC_ACK, $result, $context->organization)->encode());
     }
 
+    private static function handleTyping(string $clientId, Packet $packet): void
+    {
+        $context = self::requireContext($clientId);
+        Runtime::typing()->relay($context, $clientId, $packet->data);
+        // typing 是 fire-and-forget，不回 ack
+    }
+
+    private static function handlePresence(string $clientId, Packet $packet): void
+    {
+        $context = self::requireContext($clientId);
+        $userIds = $packet->data['user_ids'] ?? [];
+        if (!is_array($userIds)) {
+            throw new ImException('user_ids 格式错误', 'PRESENCE_USER_IDS_INVALID');
+        }
+
+        $result = Runtime::presence()->query($context, $userIds);
+        Gateway::sendToClient(
+            $clientId,
+            Packet::make(Command::PRESENCE_ACK, $result, $context->organization)->encode()
+        );
+    }
+
+    private static function handleConversationRead(string $clientId, Packet $packet): void
+    {
+        $context = self::requireContext($clientId);
+        $conversationId = trim((string) ($packet->data['conversation_id'] ?? ''));
+        $lastReadMessageId = trim((string) ($packet->data['last_read_message_id'] ?? ''));
+
+        $result = Runtime::conversationSync()->markRead($context, $clientId, $conversationId, $lastReadMessageId);
+        Gateway::sendToClient(
+            $clientId,
+            Packet::make(Command::CONVERSATION_READ_ACK, $result, $context->organization)->encode()
+        );
+    }
+
+    /**
+     * 商业模块 cmd 分发。
+     *
+     * 核心 cmd 全在 match 里，走到这里的是模块注册的扩展 cmd（cs_*、rtc_* 等）。
+     * 未注册的 cmd 仍返回 CMD_UNKNOWN。
+     */
+    private static function handleModuleCmd(string $clientId, Packet $packet): void
+    {
+        if (!Runtime::cmdDispatcher()->has($packet->cmd)) {
+            self::sendError($clientId, 'CMD_UNKNOWN', 'unknown cmd', $packet->organization, $packet->clientMsgId);
+            return;
+        }
+
+        Runtime::cmdDispatcher()->dispatch($clientId, $packet);
+    }
+
     private static function startRealtimeEventConsumer(): void
     {
         Timer::add(0.5, static function (): void {
@@ -288,15 +343,7 @@ class Events
 
     private static function requireContext(string $clientId): AuthContext
     {
-        $session = Gateway::getSession($clientId);
-        if (!is_array($session) || empty($session['user_id'])) {
-            $session = Runtime::connections()->get($clientId);
-        }
-        if (!is_array($session) || empty($session['user_id'])) {
-            throw new ImException('连接未鉴权', 'AUTH_REQUIRED');
-        }
-
-        return AuthContext::fromArray($session);
+        return SessionResolver::mustResolve($clientId);
     }
 
     private static function sendToOtherUserClients(AuthContext $context, string $currentClientId, string $payload): void

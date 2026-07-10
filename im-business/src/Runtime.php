@@ -10,11 +10,16 @@ namespace B8im\ImBusiness;
 
 use B8im\ImBusiness\Auth\ImToken;
 use B8im\ImBusiness\Connection\ConnectionStore;
+use B8im\ImBusiness\Module\ModuleRegistry;
 use B8im\ImBusiness\Repository\ImRepository;
+use B8im\ImBusiness\Service\ConversationSyncService;
 use B8im\ImBusiness\Service\DeviceService;
 use B8im\ImBusiness\Service\MessageService;
+use B8im\ImBusiness\Service\ModuleLicenseChecker;
 use B8im\ImBusiness\Service\OutboxService;
+use B8im\ImBusiness\Service\PresenceService;
 use B8im\ImBusiness\Service\RealtimeEventConsumer;
+use B8im\ImBusiness\Service\TypingService;
 
 final class Runtime
 {
@@ -24,6 +29,11 @@ final class Runtime
     private static ?DeviceService $devices = null;
     private static ?MessageService $messages = null;
     private static ?RealtimeEventConsumer $realtimeEvents = null;
+    private static ?TypingService $typing = null;
+    private static ?PresenceService $presence = null;
+    private static ?ConversationSyncService $conversationSync = null;
+    private static ?ModuleLicenseChecker $moduleLicense = null;
+    private static ?CmdDispatcher $cmdDispatcher = null;
 
     public static function boot(): void
     {
@@ -36,6 +46,14 @@ final class Runtime
         self::$devices = new DeviceService($repository);
         self::$messages = new MessageService($repository, $config, new OutboxService($repository, $config));
         self::$realtimeEvents = RealtimeEventConsumer::connect($config);
+        self::$typing = new TypingService($repository);
+        self::$presence = PresenceService::connect($config);
+        self::$conversationSync = new ConversationSyncService($repository);
+        self::$moduleLicense = ModuleLicenseChecker::connect($config, $repository);
+
+        // 模块 cmd 分发器：商业模块（客服/音视频等）在此注册自己的 cmd + license 门控
+        self::$cmdDispatcher = new CmdDispatcher();
+        ModuleRegistry::registerAll(self::$cmdDispatcher, $repository, $config, self::$moduleLicense);
     }
 
     public static function config(): Config
@@ -66,5 +84,30 @@ final class Runtime
     public static function devices(): DeviceService
     {
         return self::$devices ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function typing(): TypingService
+    {
+        return self::$typing ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function presence(): PresenceService
+    {
+        return self::$presence ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function conversationSync(): ConversationSyncService
+    {
+        return self::$conversationSync ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function cmdDispatcher(): CmdDispatcher
+    {
+        return self::$cmdDispatcher ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function moduleLicense(): ModuleLicenseChecker
+    {
+        return self::$moduleLicense ?? throw new \RuntimeException('IM Runtime 尚未启动');
     }
 }
