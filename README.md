@@ -49,13 +49,21 @@ DB_PASSWORD = root
 
 ## Docker 构建
 
-Dockerfile 需要同时读取 `b8im-im/` 和 `b8im-im-shared/`，请在
-`b8im-dev-workspace` 根目录执行：
+IM 三个运行单元共用一个参数化 `Dockerfile`，依赖安装层和
+Composer 下载缓存可以重用。建议在 `b8im-dev-workspace` 根目录使用统一脚本：
 
 ```bash
-docker build -f b8im-im/im-register/Dockerfile -t b8im/im-register .
-docker build -f b8im-im/im-gateway/Dockerfile -t b8im/im-gateway .
-docker build -f b8im-im/im-business/Dockerfile -t b8im/im-business .
+./scripts/build-images.sh im
+./scripts/build-images.sh --push im
+```
+
+如果需要直接调试单个镜像，必须为 Composer path 依赖提供 named context：
+
+```bash
+docker buildx build \
+  --build-context im-shared=../b8im-im-shared \
+  --build-arg IM_SERVICE=im-gateway \
+  -t b8im/im-gateway:local .
 ```
 
 ## IM 数据库迁移

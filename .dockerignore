@@ -1,0 +1,15 @@
+.git
+.github
+.idea
+.vscode
+.DS_Store
+**/.env
+**/.env.*
+!**/.env.example
+**/vendor
+**/runtime
+**/*.log
+**/*.pid
+**/*.tmp
+**/*.temp
+Dockerfile*
