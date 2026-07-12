@@ -23,8 +23,20 @@ $gateway = new Gateway($wsListen);
 $gateway->name = 'ImGateway';
 $gateway->count = (int) RuntimeEnvironment::value('GATEWAY_PROCESS_COUNT', '4');
 
-// 本机对内通信端口（供 BusinessWorker 连接）。多机部署时必须是内网可达 IP。
-$gateway->lanIp = RuntimeEnvironment::value('GATEWAY_LAN_IP', '127.0.0.1');
+// 本机对内通信端口（供 BusinessWorker 连接）。GatewayWorker 会把该地址同时
+// 编入 client_id 和注册中心路由键，因此 Docker 服务名必须先解析成明确 IPv4。
+$gatewayLanIp = trim((string) RuntimeEnvironment::value('GATEWAY_LAN_IP', '127.0.0.1'));
+if (filter_var($gatewayLanIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+    $resolvedLanIp = gethostbyname($gatewayLanIp);
+    if (
+        $resolvedLanIp === $gatewayLanIp
+        || filter_var($resolvedLanIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false
+    ) {
+        throw new RuntimeException('GATEWAY_LAN_IP 必须是可解析的 IPv4 或主机名');
+    }
+    $gatewayLanIp = $resolvedLanIp;
+}
+$gateway->lanIp = $gatewayLanIp;
 $gateway->startPort = (int) RuntimeEnvironment::value('GATEWAY_START_PORT', '2900');
 
 // 指向 RegisterWorker（im-register），集群所有节点共用同一个。
