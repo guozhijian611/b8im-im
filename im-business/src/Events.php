@@ -35,14 +35,18 @@ class Events
         echo date('Y-m-d H:i:s') . " ImBusiness worker started\n";
     }
 
-    /**
-     * 客户端与 Gateway 建立连接时触发。
-     *
-     * readme §6.2：连接建立后需用 IM token 鉴权，再把 client_id 与
-     * user_id / organization / device_id 绑定。此处先下发 client_id，
-     * 等待客户端发 AUTH 帧。
-     */
+    /** 客户端建立 TCP 连接时 WebSocket 握手尚未完成，不能发送业务帧。 */
     public static function onConnect($clientId): void
+    {
+    }
+
+    /**
+     * WebSocket 握手完成后下发 client_id，等待客户端发送 AUTH 帧。
+     *
+     * challenge 不能在 onConnect 发送，否则经过 Nginx 等反向代理时，
+     * 握手响应之前产生的数据帧可能被丢弃。
+     */
+    public static function onWebSocketConnect($clientId, $request): void
     {
         Gateway::sendToClient(
             $clientId,
