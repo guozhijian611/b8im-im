@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 
 const API = process.env.API ?? 'http://127.0.0.1:18888'
 const WS_URL = process.env.WS_URL ?? 'ws://127.0.0.1:18787'
@@ -7,6 +9,46 @@ const ORIGIN = process.env.ORIGIN ?? 'http://127.0.0.1:16988'
 const ORGANIZATION = Number(process.env.ORGANIZATION ?? 1)
 const OTHER_ORGANIZATION = Number(process.env.OTHER_ORGANIZATION ?? 2)
 const FORGED_ORGANIZATION = 999999
+const RUN_ID = process.env.QA_RUN_ID ?? randomUUID().replaceAll('-', '').slice(0, 16)
+const MANIFEST_PATH = resolve(process.env.QA_MANIFEST ?? `/tmp/b8im-im-reliability-${RUN_ID}.json`)
+assert.match(RUN_ID, /^[a-z0-9][a-z0-9-]{7,39}$/, 'QA_RUN_ID must be an 8-40 character QA marker')
+
+const manifest = {
+  schema_version: 1,
+  qa_run_id: RUN_ID,
+  organization: ORGANIZATION,
+  other_organization: OTHER_ORGANIZATION,
+  started_at: new Date().toISOString(),
+  accounts: [],
+  messages: []
+}
+
+function qaClientMessageId(scenario) {
+  return `qa-im-${RUN_ID}-${scenario}-${randomUUID()}`
+}
+
+function recordMessage(scenario, acknowledgement) {
+  const message = acknowledgement.data.message
+  manifest.messages.push({
+    scenario,
+    message_id: message.message_id,
+    conversation_id: message.conversation_id,
+    client_msg_id: message.client_msg_id,
+    sender_id: message.sender_id,
+    message_seq: Number(message.message_seq),
+    global_seq: String(message.global_seq)
+  })
+  return message
+}
+
+function writeManifest(result = {}) {
+  mkdirSync(dirname(MANIFEST_PATH), { recursive: true })
+  writeFileSync(MANIFEST_PATH, `${JSON.stringify({
+    ...manifest,
+    ...result,
+    finished_at: new Date().toISOString()
+  }, null, 2)}\n`, { mode: 0o600 })
+}
 
 function required(name) {
   assert.ok(process.env[name], `${name} is required`)
@@ -14,7 +56,7 @@ function required(name) {
 }
 
 function device(name) {
-  return `phase1-ws-${name}-${randomUUID()}`
+  return `qa-im-${RUN_ID}-${name}-${randomUUID()}`
 }
 
 function sleep(milliseconds) {
@@ -212,6 +254,16 @@ async function authenticate(peer, organization, webToken, deviceId) {
   return acknowledgement
 }
 
+async function takeSendAcknowledgement(peer, clientMessageId, label) {
+  const packet = await peer.take(
+    (candidate) => (candidate.cmd === 'send_ack' || candidate.cmd === 'error')
+      && candidate.client_msg_id === clientMessageId,
+    label
+  )
+  assert.equal(packet.cmd, 'send_ack', JSON.stringify(packet))
+  return packet
+}
+
 async function syncFromZero(peer, organization, messageId) {
   let cursor = '0'
   for (let page = 0; page < 100; page += 1) {
@@ -245,17 +297,23 @@ const deviceA = device('alice')
 const deviceB = device('bob')
 const deviceX = device('alice-other')
 const [sessionA, sessionB, otherSession] = await Promise.all([
-  login(ORGANIZATION, process.env.A_ACCOUNT ?? 'alice', required('A_PASSWORD'), deviceA),
-  login(ORGANIZATION, process.env.B_ACCOUNT ?? 'bob', required('B_PASSWORD'), deviceB),
+  login(ORGANIZATION, process.env.A_ACCOUNT ?? 'qa_im_a', required('A_PASSWORD'), deviceA),
+  login(ORGANIZATION, process.env.B_ACCOUNT ?? 'qa_im_b', required('B_PASSWORD'), deviceB),
   login(
     OTHER_ORGANIZATION,
-    process.env.X_ACCOUNT ?? 'alice2',
+    process.env.X_ACCOUNT ?? 'qa_im_x',
     required('X_PASSWORD'),
     deviceX
   )
 ])
 assert.notEqual(sessionA.userId, sessionB.userId)
 assert.notEqual(otherSession.userId, sessionA.userId)
+assert.notEqual(otherSession.userId, sessionB.userId)
+manifest.accounts = [
+  { organization: ORGANIZATION, account: process.env.A_ACCOUNT ?? 'qa_im_a', user_id: sessionA.userId },
+  { organization: ORGANIZATION, account: process.env.B_ACCOUNT ?? 'qa_im_b', user_id: sessionB.userId },
+  { organization: OTHER_ORGANIZATION, account: process.env.X_ACCOUNT ?? 'qa_im_x', user_id: otherSession.userId }
+]
 
 const peers = []
 try {
@@ -281,8 +339,8 @@ try {
     sameDeviceCoexist = true
   }
 
-  const clientMessageId = `phase1-${randomUUID()}`
-  alice.send({
+  const clientMessageId = qaClientMessageId('online')
+  const onlineSend = {
     cmd: 'send',
     organization: FORGED_ORGANIZATION,
     client_msg_id: clientMessageId,
@@ -290,17 +348,15 @@ try {
       conversation_type: 1,
       to_user_id: sessionB.userId,
       message_type: 1,
-      content: { text: `phase1 live smoke ${new Date().toISOString()}` }
+      content: { text: `[QA:${RUN_ID}] online delivery ${new Date().toISOString()}` }
     }
-  })
-  const sendAcknowledgement = await alice.take(
-    (packet) => packet.cmd === 'send_ack' && packet.client_msg_id === clientMessageId,
-    'SEND_ACK'
-  )
+  }
+  alice.send(onlineSend)
+  const sendAcknowledgement = await takeSendAcknowledgement(alice, clientMessageId, 'SEND_ACK')
   assert.equal(Number(sendAcknowledgement.organization), ORGANIZATION)
   assert.equal(sendAcknowledgement.data?.ok, true)
   assert.equal(sendAcknowledgement.data?.duplicated, false)
-  const message = sendAcknowledgement.data.message
+  const message = recordMessage('online_delivery', sendAcknowledgement)
 
   const push = await bob.take(
     (packet) => packet.cmd === 'push'
@@ -323,6 +379,21 @@ try {
     )
   ])
 
+  alice.send(onlineSend)
+  const duplicateAcknowledgement = await takeSendAcknowledgement(
+    alice,
+    clientMessageId,
+    'duplicate SEND_ACK'
+  )
+  assert.equal(duplicateAcknowledgement.data?.duplicated, true)
+  assert.equal(duplicateAcknowledgement.data?.message?.message_id, message.message_id)
+  assert.equal(duplicateAcknowledgement.data?.message?.global_seq, message.global_seq)
+  await bob.expectNone(
+    (packet) => packet.cmd === 'push'
+      && packet.data?.message?.message_id === message.message_id,
+    'PUSH after duplicate SEND'
+  )
+
   bob.send({
     cmd: 'ack',
     organization: FORGED_ORGANIZATION,
@@ -343,11 +414,23 @@ try {
   assert.equal(ackAcknowledgement.data.status, 2)
   assert.equal(Number(senderAck.organization), ORGANIZATION)
 
+  bob.send({
+    cmd: 'ack',
+    organization: FORGED_ORGANIZATION,
+    data: { message_id: message.message_id, status: 'delivered' }
+  })
+  const duplicateAck = await bob.take(
+    (packet) => packet.cmd === 'ack_ack'
+      && packet.data?.message_id === message.message_id,
+    'duplicate ACK_ACK'
+  )
+  assert.equal(duplicateAck.data.status, 2)
+
   let assetResult = null
   const fileId = String(process.env.FILE_ID ?? '')
   if (fileId !== '') {
     assert.match(fileId, /^[a-f0-9]{40}$/)
-    const assetClientMessageId = `phase1-asset-${randomUUID()}`
+    const assetClientMessageId = qaClientMessageId('asset')
     alice.send({
       cmd: 'send',
       organization: FORGED_ORGANIZATION,
@@ -359,13 +442,13 @@ try {
         content: { file_id: fileId }
       }
     })
-    const assetAcknowledgement = await alice.take(
-      (packet) => packet.cmd === 'send_ack'
-        && packet.client_msg_id === assetClientMessageId,
+    const assetAcknowledgement = await takeSendAcknowledgement(
+      alice,
+      assetClientMessageId,
       'asset SEND_ACK'
     )
     assert.equal(assetAcknowledgement.data?.message?.content?.file_id, fileId)
-    const assetMessage = assetAcknowledgement.data.message
+    const assetMessage = recordMessage('asset_delivery', assetAcknowledgement)
     await bob.take(
       (packet) => packet.cmd === 'push'
         && packet.data?.message?.message_id === assetMessage.message_id,
@@ -379,7 +462,7 @@ try {
     }
   }
 
-  const crossTenantId = `phase1-cross-${randomUUID()}`
+  const crossTenantId = qaClientMessageId('cross-organization')
   alice.send({
     cmd: 'send',
     organization: OTHER_ORGANIZATION,
@@ -388,7 +471,7 @@ try {
       conversation_type: 1,
       to_user_id: otherSession.userId,
       message_type: 1,
-      content: { text: 'cross-tenant rejection probe' }
+      content: { text: `[QA:${RUN_ID}] cross-organization rejection probe` }
     }
   })
   const crossTenantError = await alice.take(
@@ -417,11 +500,54 @@ try {
 
   await bob.close()
   await sleep(200)
+
+  const offlineMessages = []
+  for (const ordinal of [1, 2]) {
+    const offlineId = qaClientMessageId(`offline-${ordinal}`)
+    alice.send({
+      cmd: 'send',
+      organization: FORGED_ORGANIZATION,
+      client_msg_id: offlineId,
+      data: {
+        conversation_type: 1,
+        to_user_id: sessionB.userId,
+        message_type: 1,
+        content: { text: `[QA:${RUN_ID}] offline recovery ${ordinal}` }
+      }
+    })
+    const offlineAck = await takeSendAcknowledgement(
+      alice,
+      offlineId,
+      `offline SEND_ACK ${ordinal}`
+    )
+    assert.equal(offlineAck.data?.duplicated, false)
+    offlineMessages.push(recordMessage(`offline_recovery_${ordinal}`, offlineAck))
+  }
+  assert.equal(
+    Number(offlineMessages[1].message_seq),
+    Number(offlineMessages[0].message_seq) + 1,
+    'offline messages must have contiguous conversation sequence numbers'
+  )
+  assert.equal(
+    BigInt(offlineMessages[1].global_seq) > BigInt(offlineMessages[0].global_seq),
+    true,
+    'offline messages must have increasing organization sequence numbers'
+  )
+
   const reconnectedBob = await new Peer('bob-reconnect').open()
   peers.push(reconnectedBob)
   await authenticate(reconnectedBob, ORGANIZATION, sessionB.token, deviceB)
   const synced = await syncFromZero(reconnectedBob, ORGANIZATION, message.message_id)
   assert.equal(synced.global_seq, message.global_seq)
+  for (const offlineMessage of offlineMessages) {
+    const recovered = await syncFromZero(
+      reconnectedBob,
+      ORGANIZATION,
+      offlineMessage.message_id
+    )
+    assert.equal(recovered.global_seq, offlineMessage.global_seq)
+    assert.equal(recovered.message_seq, offlineMessage.message_seq)
+  }
 
   let adminSessionRevoke = false
   if (process.env.ADMIN_REVOKE_CHECK === '1') {
@@ -508,8 +634,10 @@ try {
     }
   }
 
-  console.log(JSON.stringify({
+  const result = {
     ok: true,
+    qa_run_id: RUN_ID,
+    manifest: MANIFEST_PATH,
     organization: ORGANIZATION,
     message_id: message.message_id,
     conversation_id: message.conversation_id,
@@ -518,11 +646,22 @@ try {
     cross_tenant_error: crossTenantError.data.code,
     invalid_sync_error: invalidSync.data.code,
     sync_found: true,
+    duplicate_send_idempotent: true,
+    duplicate_ack_monotonic: true,
+    offline_recovery_count: offlineMessages.length,
     same_device_coexist: sameDeviceCoexist,
     admin_session_revoke: adminSessionRevoke,
     organization_disable: organizationDisable,
     ...(assetResult ?? {})
-  }))
+  }
+  writeManifest({ ok: true, result })
+  console.log(JSON.stringify(result))
+} catch (error) {
+  writeManifest({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error)
+  })
+  throw error
 } finally {
   await Promise.allSettled(peers.map((peer) => peer.close()))
 }

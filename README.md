@@ -162,3 +162,59 @@ RabbitMQ 消费者是唯一实时业务事件投递路径。
 - 独立进程显式设置 `Gateway::$registerAddress` 和内部密钥，先按 `organization:user_id` 查询当前 client，每个 Gateway 写入成功后在 Redis 记录 `event_id + client_id` 投递检查点，全部成功后才 ACK RabbitMQ。
 - 投递异常以 `organization + message_id + event_type + change_seq` 在 Redis 原子计数，超过 `MQ_REALTIME_MAX_RETRY` 后 reject 至既有 DLX/DLQ；坏 JSON、不支持的事件和 schema 冲突不会被静默 ACK。
 - packet 显式携带稳定 `event_id`、`message_seq` 和 `change_seq`，客户端必须以事件与序号幂等去重。RabbitMQ 仍是至少一次语义；进程恰好在 Gateway 写入成功后、检查点持久化前崩溃时仍可能重复，但不会因预先标记而丢失事件。
+
+## IM 可靠性真链路回归
+
+`im-business/tests/run_live_reliability.sh` 是本机与测试环境共用的统一入口，不使用
+mock。每次运行使用 `qa-im-<QA_RUN_ID>-*` 幂等 ID 和 `[QA:<QA_RUN_ID>]` 内容标记，
+并生成只包含 QA 用户和本次消息 ID 的 JSON manifest。
+
+真实 WebSocket 部分覆盖：
+
+- A 发送、`SEND_ACK`、RabbitMQ `PUSH`，且发起连接不自回声。
+- 同一 `client_msg_id` 重发返回原消息且不产生第二次 PUSH。
+- B 送达 `ACK / ACK_ACK`，重复 ACK 不增加回执行且状态不回退。
+- B 断线期间连续消息的会话序号连续、机构全局序号单调，重连 AUTH 后依靠
+  SYNC 无缺口恢复。
+- 客户端伪造 organization 不影响服务端身份，跨 organization 收件人被拒绝。
+
+数据和基础设施审计覆盖：消息全局索引与分片行一致、幂等唯一索引存在、
+回执单行、outbox 已发布且 claim 已释放、RabbitMQ ready/DLQ/消费者阈值和指定日志的
+严重错误特征。
+
+本机全链路（默认成功后精确清理本次 QA 消息）：
+
+```bash
+cd im-business
+API=http://127.0.0.1:18888 \
+WS_URL=ws://127.0.0.1:18787 \
+ORIGIN=http://127.0.0.1:16988 \
+ORGANIZATION=1 OTHER_ORGANIZATION=2 \
+A_ACCOUNT=qa_im_a A_PASSWORD='<qa-password>' \
+B_ACCOUNT=qa_im_b B_PASSWORD='<qa-password>' \
+X_ACCOUNT=qa_im_x X_PASSWORD='<qa-password>' \
+QA_LOG_FILES=/path/to/im-business.log,/path/to/im-realtime.log \
+composer test-live-reliability
+```
+
+测试环境先在可访问公网 API/WebSocket 的机器运行协议回归，再把 manifest 复制到
+SSH `b8im` 中的 `im-business` 容器执行数据库/RabbitMQ/日志审计和清理：
+
+```bash
+# 公网协议链路
+QA_CLEANUP_AFTER=0 API=https://api.example.test WS_URL=wss://api.example.test/_wukongim_ws \
+  ORIGIN=https://web.example.test ORGANIZATION=1 OTHER_ORGANIZATION=2 \
+  A_ACCOUNT=qa_im_a A_PASSWORD='<qa-password>' B_ACCOUNT=qa_im_b B_PASSWORD='<qa-password>' \
+  X_ACCOUNT=qa_im_x X_PASSWORD='<qa-password>' \
+  composer test-live-reliability-websocket
+
+# 在 IM 运行环境中使用上一步输出的绝对 manifest 路径
+QA_MANIFEST=/tmp/b8im-im-reliability-<run-id>.json composer test-live-reliability-audit
+QA_MANIFEST=/tmp/b8im-im-reliability-<run-id>.json composer test-live-reliability-cleanup
+```
+
+审计默认要求 `im.message.after` ready=0、DLQ=0 且至少一个消费者。有已知基线积压时可显式设置
+`QA_RABBIT_MAX_READY`、`QA_RABBIT_MAX_DLX`、`QA_RABBIT_MIN_CONSUMERS`，不允许脚本自动忽略。
+清理命令只接受 manifest 中的精确 `message_id` 且会二次核对 `qa-im-<QA_RUN_ID>-`
+前缀；对话中存在非本次 manifest 消息或非 QA 成员时将拒绝执行，因此每次回归前要重置
+专用 QA 账号。该命令不删除测试账号，账号创建/重置与删除由控制面 QA 命令负责。
