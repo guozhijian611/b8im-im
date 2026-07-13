@@ -170,6 +170,7 @@ RabbitMQ 消费者是唯一实时业务事件投递路径。
 - 消息主体、`im_message_index` 与 `im_message_outbox` 仍在同一 MySQL 事务内写入。Outbox 只用独立 `traceparent` / `tracestate` 列保存因果上下文，不从 payload 兼容读取。
 - Publisher 每次尝试都创建新 PRODUCER span，并注入 RabbitMQ `application_headers`；Consumer 提取后创建新 CONSUMER span，RealtimeDelivery 与每次 Gateway PUSH 继续生成新 span id。
 - 业务索引属性统一使用 `b8im.organization` / `b8im.message_id` / `b8im.conversation_id` / `b8im.client_msg_id` / `b8im.outbox_id` / `b8im.event_id`，不双写旧字段。资源中 `service.name` 由进程受信代码固定，`OTEL_SERVICE_NAME` 不能覆盖；`OTEL_SERVICE_VERSION` 只接受 1..64 位安全标识字符。
+- Workerman 5 会在独立 Fiber 中执行每个 `onWorkerStart`；IM telemetry adapter 会在该 Fiber 或 CLI 执行上下文首次使用 OTel 前显式 attach root context，重复 boot 不重复 attach，worker shutdown 时统一 detach。
 - OTLP 固定使用 HTTP/protobuf，默认只上报 `otel-collector`；超时统一使用 OTel 标准毫秒环境变量 `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`。长驻进程使用有界 batch queue 和定时 flush；Exporter/Collector 超时或不可用时丢弃 telemetry 并限频告警，不回滚事务、不 NACK 正常消息、不阻断 PUSH。
 - Span 和 exception event 不采集 Authorization、Cookie、密码、token、消息正文、完整请求/响应体、带参 SQL、附件 URL 或 secret。
 

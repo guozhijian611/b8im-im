@@ -10,6 +10,7 @@ namespace B8im\ImBusiness\Telemetry;
 
 use B8im\ImBusiness\Config;
 use B8im\ImShared\Telemetry\TraceContext;
+use Fiber;
 use OpenTelemetry\API\Common\Time\Clock;
 use OpenTelemetry\API\Behavior\Internal\Logging;
 use OpenTelemetry\API\Trace\NoopTracerProvider;
@@ -22,12 +23,14 @@ use OpenTelemetry\API\Trace\TracerInterface;
 use OpenTelemetry\Contrib\Otlp\OtlpHttpTransportFactory;
 use OpenTelemetry\Contrib\Otlp\SpanExporter;
 use OpenTelemetry\Context\Context;
+use OpenTelemetry\Context\ScopeInterface;
 use OpenTelemetry\SDK\Common\Attribute\Attributes;
 use OpenTelemetry\SDK\Resource\ResourceInfo;
 use OpenTelemetry\SDK\Trace\SpanProcessor\BatchSpanProcessor;
 use OpenTelemetry\SDK\Trace\TracerProvider;
 use OpenTelemetry\SDK\Trace\TracerProviderInterface;
 use Throwable;
+use WeakMap;
 use Workerman\Timer;
 
 final class Telemetry
@@ -38,9 +41,13 @@ final class Telemetry
     private static string $serviceName = 'b8im-im-business';
     private static int $flushTimerId = 0;
     private static float $lastExportWarningAt = 0.0;
+    private static ?ScopeInterface $mainRootScope = null;
+    /** @var WeakMap<Fiber, ScopeInterface>|null */
+    private static ?WeakMap $fiberRootScopes = null;
 
     public static function boot(Config $config, string $serviceName): void
     {
+        self::ensureContextInitialized();
         if (self::$provider !== null || self::$tracer !== null) {
             return;
         }
@@ -111,6 +118,7 @@ final class Telemetry
         array $attributes = [],
     ): SpanScope {
         try {
+            self::ensureContextInitialized();
             $tracer = self::$tracer ?? (new NoopTracerProvider())->getTracer('b8im/im');
             $builder = $tracer->spanBuilder($name)->setSpanKind($kind)->setAttributes(self::safeAttributes($attributes));
             if ($parent !== null) {
@@ -130,6 +138,7 @@ final class Telemetry
     public static function currentTraceContext(): ?TraceContext
     {
         try {
+            self::ensureContextInitialized();
             $carrier = [];
             TraceContextPropagator::getInstance()->inject($carrier);
             return TraceContext::fromCarrier($carrier['traceparent'] ?? null, $carrier['tracestate'] ?? null);
@@ -202,7 +211,12 @@ final class Telemetry
 
     public static function setCurrentAttributes(array $attributes): void
     {
-        self::setAttributes(Span::getCurrent(), $attributes);
+        try {
+            self::ensureContextInitialized();
+            self::setAttributes(Span::getCurrent(), $attributes);
+        } catch (Throwable $throwable) {
+            self::instrumentationFailed($throwable);
+        }
     }
 
     public static function flush(): bool
@@ -211,6 +225,7 @@ final class Telemetry
             return true;
         }
         try {
+            self::ensureContextInitialized();
             $ok = self::$provider->forceFlush();
             if (!$ok) {
                 self::warn('export', new \RuntimeException('OTLP forceFlush returned false'));
@@ -226,6 +241,7 @@ final class Telemetry
 
     public static function shutdown(): void
     {
+        self::ensureContextInitialized();
         if (self::$flushTimerId > 0) {
             Timer::del(self::$flushTimerId);
             self::$flushTimerId = 0;
@@ -234,8 +250,12 @@ final class Telemetry
             self::$provider?->shutdown();
         } catch (Throwable $throwable) {
             self::warn('shutdown', $throwable);
+        } finally {
+            self::$provider = null;
+            self::$tracer = null;
+            self::$enabled = false;
+            self::releaseContextRoots();
         }
-        self::$enabled = false;
     }
 
     public static function exportFailed(?Throwable $throwable = null): void
@@ -311,6 +331,48 @@ final class Telemetry
         }
 
         return true;
+    }
+
+    /**
+     * Workerman 5 runs every onWorkerStart callback in a fresh Fiber even when
+     * the selected event loop is not Fiber based. OpenTelemetry deliberately
+     * does not inherit context into arbitrary Fibers, so each execution context
+     * needs an explicit root before the first current()/activate() access.
+     */
+    private static function ensureContextInitialized(): void
+    {
+        $fiber = Fiber::getCurrent();
+        if ($fiber === null) {
+            self::$mainRootScope ??= Context::storage()->attach(Context::getRoot());
+
+            return;
+        }
+
+        self::$fiberRootScopes ??= new WeakMap();
+        if (!isset(self::$fiberRootScopes[$fiber])) {
+            self::$fiberRootScopes[$fiber] = Context::storage()->attach(Context::getRoot());
+        }
+    }
+
+    private static function releaseContextRoots(): void
+    {
+        if (self::$fiberRootScopes !== null) {
+            foreach (self::$fiberRootScopes as $scope) {
+                try {
+                    $scope->detach();
+                } catch (Throwable $throwable) {
+                    self::instrumentationFailed($throwable);
+                }
+            }
+            self::$fiberRootScopes = null;
+        }
+
+        try {
+            self::$mainRootScope?->detach();
+        } catch (Throwable $throwable) {
+            self::instrumentationFailed($throwable);
+        }
+        self::$mainRootScope = null;
     }
 
     private static function warn(string $operation, Throwable $throwable): void
