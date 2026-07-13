@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 mode="${1:-all}"
 case "$mode" in
@@ -10,15 +10,28 @@ case "$mode" in
     ;;
 esac
 
-if [[ "$mode" == "websocket" || "$mode" == "all" ]]; then
-  : "${A_PASSWORD:?A_PASSWORD is required}"
-  : "${B_PASSWORD:?B_PASSWORD is required}"
-  : "${X_PASSWORD:?X_PASSWORD is required}"
-  export QA_RUN_ID="${QA_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$RANDOM}"
-  export QA_MANIFEST="${QA_MANIFEST:-/tmp/b8im-im-reliability-${QA_RUN_ID}.json}"
-else
-  : "${QA_MANIFEST:?QA_MANIFEST is required for $mode}"
+if [ "$mode" = "all" ]; then
+  case "${QA_CLEANUP_AFTER:-1}" in
+    0|1) ;;
+    *)
+      echo "QA_CLEANUP_AFTER must be 0 or 1" >&2
+      exit 64
+      ;;
+  esac
 fi
+
+case "$mode" in
+  websocket|all)
+    : "${A_PASSWORD:?A_PASSWORD is required}"
+    : "${B_PASSWORD:?B_PASSWORD is required}"
+    : "${X_PASSWORD:?X_PASSWORD is required}"
+    export QA_RUN_ID="${QA_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
+    export QA_MANIFEST="${QA_MANIFEST:-/tmp/b8im-im-reliability-${QA_RUN_ID}.json}"
+    ;;
+  audit|cleanup)
+    : "${QA_MANIFEST:?QA_MANIFEST is required for $mode}"
+    ;;
+esac
 
 run_websocket() {
   node tests/live_phase1_websocket.mjs
@@ -39,9 +52,10 @@ case "$mode" in
   all)
     run_websocket
     run_audit
-    if [[ "${QA_CLEANUP_AFTER:-1}" == "1" ]]; then
-      run_cleanup
-    fi
+    case "${QA_CLEANUP_AFTER:-1}" in
+      1) run_cleanup ;;
+      0) ;;
+    esac
     ;;
 esac
 
