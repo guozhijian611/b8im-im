@@ -9,6 +9,7 @@ declare(strict_types=1);
 use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Process\OutboxPublisherProcess;
 use Workerman\Worker;
+use B8im\ImBusiness\Telemetry\Telemetry;
 
 $outboxConfig = Config::fromEnv();
 if ($outboxConfig->mqOutboxEnabled && $outboxConfig->mqOutboxProcessCount > 0) {
@@ -17,5 +18,8 @@ if ($outboxConfig->mqOutboxEnabled && $outboxConfig->mqOutboxProcessCount > 0) {
     $outboxWorker->count = $outboxConfig->mqOutboxProcessCount;
     $outboxWorker->onWorkerStart = static function () use ($outboxConfig): void {
         (new OutboxPublisherProcess($outboxConfig))->start();
+    };
+    $outboxWorker->onWorkerStop = static function (): void {
+        Telemetry::shutdown();
     };
 }

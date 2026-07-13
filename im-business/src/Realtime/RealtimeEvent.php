@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace B8im\ImBusiness\Realtime;
 
 use B8im\ImShared\Protocol\Packet;
+use B8im\ImShared\Telemetry\TraceContext;
 
 final class RealtimeEvent
 {
@@ -30,12 +31,14 @@ final class RealtimeEvent
     ) {
     }
 
-    public function encodedPacket(): string
+    public function encodedPacket(?TraceContext $traceContext = null): string
     {
         return Packet::make(
             $this->packetCommand,
             [...$this->packetData, 'event_id' => $this->eventId()],
             $this->organization,
+            null,
+            $traceContext,
         )->encode();
     }
 

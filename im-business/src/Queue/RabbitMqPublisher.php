@@ -15,6 +15,7 @@ use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
 use Throwable;
+use B8im\ImShared\Telemetry\TraceContext;
 
 final class RabbitMqPublisher
 {
@@ -26,7 +27,12 @@ final class RabbitMqPublisher
     {
     }
 
-    public function publish(string $routingKey, array $payload, string $messageId): void
+    public function publish(
+        string $routingKey,
+        array $payload,
+        string $messageId,
+        ?TraceContext $traceContext = null,
+    ): void
     {
         try {
             $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
@@ -35,10 +41,7 @@ final class RabbitMqPublisher
                 'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
                 'message_id' => $messageId,
                 'timestamp' => time(),
-                'application_headers' => new AMQPTable([
-                    'organization' => (int) ($payload['organization'] ?? 0),
-                    'event_type' => (string) ($payload['event_type'] ?? ''),
-                ]),
+                'application_headers' => new AMQPTable(self::applicationHeaders($payload, $traceContext)),
             ]);
 
             $this->channel()->basic_publish(
@@ -52,6 +55,17 @@ final class RabbitMqPublisher
             $this->close();
             throw $throwable;
         }
+    }
+
+    /** @return array<string, int|string> */
+    public static function applicationHeaders(array $payload, ?TraceContext $traceContext): array
+    {
+        return array_filter([
+            'organization' => (int) ($payload['organization'] ?? 0),
+            'event_type' => (string) ($payload['event_type'] ?? ''),
+            'traceparent' => $traceContext?->traceparent,
+            'tracestate' => $traceContext?->tracestate,
+        ], static fn (mixed $value): bool => $value !== null && $value !== '');
     }
 
     public function close(): void

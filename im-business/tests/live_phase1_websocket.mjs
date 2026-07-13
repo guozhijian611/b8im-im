@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 
@@ -13,6 +13,23 @@ const RUN_ID = process.env.QA_RUN_ID ?? randomUUID().replaceAll('-', '').slice(0
 const MANIFEST_PATH = resolve(process.env.QA_MANIFEST ?? `/tmp/b8im-im-reliability-${RUN_ID}.json`)
 assert.match(RUN_ID, /^[a-z0-9][a-z0-9-]{7,39}$/, 'QA_RUN_ID must be an 8-40 character QA marker')
 
+function newTraceparent() {
+  return `00-${randomBytes(16).toString('hex')}-${randomBytes(8).toString('hex')}-01`
+}
+
+function traceIdOf(traceparent) {
+  const match = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(traceparent)
+  assert.ok(match, 'traceparent must be canonical W3C version 00')
+  assert.notEqual(match[1], '0'.repeat(32), 'trace-id must be non-zero')
+  assert.notEqual(match[2], '0'.repeat(16), 'parent-id must be non-zero')
+  return match[1]
+}
+
+const SUCCESS_TRACEPARENT = process.env.B8IM_TRACEPARENT ?? newTraceparent()
+const SUCCESS_TRACE_ID = traceIdOf(SUCCESS_TRACEPARENT)
+const CROSS_TENANT_TRACEPARENT = newTraceparent()
+const CROSS_TENANT_TRACE_ID = traceIdOf(CROSS_TENANT_TRACEPARENT)
+
 const manifest = {
   schema_version: 1,
   qa_run_id: RUN_ID,
@@ -20,14 +37,16 @@ const manifest = {
   other_organization: OTHER_ORGANIZATION,
   started_at: new Date().toISOString(),
   accounts: [],
-  messages: []
+  messages: [],
+  success_trace_id: SUCCESS_TRACE_ID,
+  cross_tenant_trace_id: CROSS_TENANT_TRACE_ID
 }
 
 function qaClientMessageId(scenario) {
   return `qa-im-${RUN_ID}-${scenario}-${randomUUID()}`
 }
 
-function recordMessage(scenario, acknowledgement) {
+function recordMessage(scenario, acknowledgement, traceId = null) {
   const message = acknowledgement.data.message
   manifest.messages.push({
     scenario,
@@ -36,7 +55,8 @@ function recordMessage(scenario, acknowledgement) {
     client_msg_id: message.client_msg_id,
     sender_id: message.sender_id,
     message_seq: Number(message.message_seq),
-    global_seq: String(message.global_seq)
+    global_seq: String(message.global_seq),
+    ...(traceId === null ? {} : { trace_id: traceId })
   })
   return message
 }
@@ -63,7 +83,7 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-async function post(organization, path, body, token = '') {
+async function post(organization, path, body, token = '', traceparent = null) {
   const headers = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
@@ -72,6 +92,10 @@ async function post(organization, path, body, token = '') {
   }
   if (token !== '') {
     headers.Authorization = `Bearer ${token}`
+  }
+  if (traceparent !== null) {
+    traceIdOf(traceparent)
+    headers.traceparent = traceparent
   }
 
   const response = await fetch(new URL(path, API), {
@@ -205,7 +229,7 @@ class Peer {
 
   send(packet) {
     assert.equal(this.socket.readyState, WebSocket.OPEN)
-    this.socket.send(JSON.stringify({ ...packet, ts: Date.now() }))
+    this.socket.send(JSON.stringify({ traceparent: newTraceparent(), ...packet, ts: Date.now() }))
   }
 
   async close() {
@@ -228,10 +252,12 @@ async function authenticate(peer, organization, webToken, deviceId) {
   const clientId = String(challenge.data?.client_id ?? '')
   assert.ok(clientId)
 
+  const authTraceparent = newTraceparent()
+  const authTraceId = traceIdOf(authTraceparent)
   const credential = await post(organization, '/saimulti/web/im/imToken', {
     device_id: deviceId,
     client_id: clientId
-  }, webToken)
+  }, webToken, authTraceparent)
   const claims = JSON.parse(
     Buffer.from(credential.token.split('.')[1], 'base64url').toString('utf8')
   )
@@ -239,6 +265,7 @@ async function authenticate(peer, organization, webToken, deviceId) {
   peer.send({
     cmd: 'auth',
     organization: FORGED_ORGANIZATION,
+    traceparent: authTraceparent,
     data: { token: credential.token, device_id: deviceId, platform: 'web' }
   })
   const acknowledgement = await peer.take(
@@ -251,7 +278,8 @@ async function authenticate(peer, organization, webToken, deviceId) {
   assert.equal(acknowledgement.data?.device_id, deviceId)
   assert.equal(acknowledgement.data?.credential_session_id, claims.session_id)
   assert.match(String(acknowledgement.data?.session_id ?? ''), /^[a-f0-9]{32}$/)
-  return acknowledgement
+  assert.equal(traceIdOf(acknowledgement.traceparent), authTraceId)
+  return authTraceId
 }
 
 async function takeSendAcknowledgement(peer, clientMessageId, label) {
@@ -320,8 +348,9 @@ try {
   const alice = await new Peer('alice').open()
   const bob = await new Peer('bob').open()
   peers.push(alice, bob)
-  await authenticate(alice, ORGANIZATION, sessionA.token, deviceA)
+  const authTraceId = await authenticate(alice, ORGANIZATION, sessionA.token, deviceA)
   await authenticate(bob, ORGANIZATION, sessionB.token, deviceB)
+  manifest.auth_trace_id = authTraceId
 
   let sameDeviceCoexist = false
   if (process.env.COEXIST_CHECK === '1') {
@@ -344,6 +373,7 @@ try {
     cmd: 'send',
     organization: FORGED_ORGANIZATION,
     client_msg_id: clientMessageId,
+    traceparent: SUCCESS_TRACEPARENT,
     data: {
       conversation_type: 1,
       to_user_id: sessionB.userId,
@@ -356,7 +386,8 @@ try {
   assert.equal(Number(sendAcknowledgement.organization), ORGANIZATION)
   assert.equal(sendAcknowledgement.data?.ok, true)
   assert.equal(sendAcknowledgement.data?.duplicated, false)
-  const message = recordMessage('online_delivery', sendAcknowledgement)
+  assert.equal(traceIdOf(sendAcknowledgement.traceparent), SUCCESS_TRACE_ID)
+  const message = recordMessage('online_delivery', sendAcknowledgement, SUCCESS_TRACE_ID)
 
   const push = await bob.take(
     (packet) => packet.cmd === 'push'
@@ -365,6 +396,7 @@ try {
     15_000
   )
   assert.equal(Number(push.organization), ORGANIZATION)
+  assert.equal(traceIdOf(push.traceparent), SUCCESS_TRACE_ID)
   assert.match(String(push.data?.event_id ?? ''), /^[a-f0-9]{64}$/)
   await Promise.all([
     bob.expectNone(
@@ -379,7 +411,7 @@ try {
     )
   ])
 
-  alice.send(onlineSend)
+  alice.send({ ...onlineSend, traceparent: newTraceparent() })
   const duplicateAcknowledgement = await takeSendAcknowledgement(
     alice,
     clientMessageId,
@@ -467,6 +499,7 @@ try {
     cmd: 'send',
     organization: OTHER_ORGANIZATION,
     client_msg_id: crossTenantId,
+    traceparent: CROSS_TENANT_TRACEPARENT,
     data: {
       conversation_type: 1,
       to_user_id: otherSession.userId,
@@ -480,6 +513,7 @@ try {
   )
   assert.equal(Number(crossTenantError.organization), ORGANIZATION)
   assert.equal(crossTenantError.data?.code, 'SEND_SINGLE_RECEIVER_INVALID')
+  assert.equal(traceIdOf(crossTenantError.traceparent), CROSS_TENANT_TRACE_ID)
 
   const invalidSyncId = `phase1-bad-sync-${randomUUID()}`
   bob.send({
@@ -643,6 +677,9 @@ try {
     conversation_id: message.conversation_id,
     message_seq: message.message_seq,
     global_seq: message.global_seq,
+    trace_id: SUCCESS_TRACE_ID,
+    auth_trace_id: authTraceId,
+    cross_tenant_trace_id: CROSS_TENANT_TRACE_ID,
     cross_tenant_error: crossTenantError.data.code,
     invalid_sync_error: invalidSync.data.code,
     sync_found: true,

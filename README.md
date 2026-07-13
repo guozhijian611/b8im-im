@@ -163,6 +163,16 @@ RabbitMQ 消费者是唯一实时业务事件投递路径。
 - 投递异常以 `organization + message_id + event_type + change_seq` 在 Redis 原子计数，超过 `MQ_REALTIME_MAX_RETRY` 后 reject 至既有 DLX/DLQ；坏 JSON、不支持的事件和 schema 冲突不会被静默 ACK。
 - packet 显式携带稳定 `event_id`、`message_seq` 和 `change_seq`，客户端必须以事件与序号幂等去重。RabbitMQ 仍是至少一次语义；进程恰好在 Gateway 写入成功后、检查点持久化前崩溃时仍可能重复，但不会因预先标记而丢失事件。
 
+## OpenTelemetry Trace
+
+- WebSocket JSON 帧顶层可选携带 W3C `traceparent` / `tracestate`；只接受严格的 version 00 格式，不支持 baggage，不从业务 `data` 读取 trace 上下文。
+- 每个 AUTH/SEND/ACK/SYNC 等客户端命令创建独立 server span；ACK/ERROR 使用同一 trace 的新 span context 回传。
+- 消息主体、`im_message_index` 与 `im_message_outbox` 仍在同一 MySQL 事务内写入。Outbox 只用独立 `traceparent` / `tracestate` 列保存因果上下文，不从 payload 兼容读取。
+- Publisher 每次尝试都创建新 PRODUCER span，并注入 RabbitMQ `application_headers`；Consumer 提取后创建新 CONSUMER span，RealtimeDelivery 与每次 Gateway PUSH 继续生成新 span id。
+- 业务索引属性统一使用 `b8im.organization` / `b8im.message_id` / `b8im.conversation_id` / `b8im.client_msg_id` / `b8im.outbox_id` / `b8im.event_id`，不双写旧字段。资源中 `service.name` 由进程受信代码固定，`OTEL_SERVICE_NAME` 不能覆盖；`OTEL_SERVICE_VERSION` 只接受 1..64 位安全标识字符。
+- OTLP 固定使用 HTTP/protobuf，默认只上报 `otel-collector`；超时统一使用 OTel 标准毫秒环境变量 `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`。长驻进程使用有界 batch queue 和定时 flush；Exporter/Collector 超时或不可用时丢弃 telemetry 并限频告警，不回滚事务、不 NACK 正常消息、不阻断 PUSH。
+- Span 和 exception event 不采集 Authorization、Cookie、密码、token、消息正文、完整请求/响应体、带参 SQL、附件 URL 或 secret。
+
 ## IM 可靠性真链路回归
 
 `im-business/tests/run_live_reliability.sh` 是本机与测试环境共用的统一入口，不使用

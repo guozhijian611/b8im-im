@@ -17,6 +17,8 @@ use B8im\ImBusiness\Service\TenantImPolicyService;
 use B8im\ImShared\Protocol\MessageType;
 use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Support\Constants;
+use B8im\ImBusiness\Telemetry\Telemetry;
+use B8im\ImShared\Telemetry\TraceContext;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
@@ -24,7 +26,16 @@ if (is_file(dirname(__DIR__) . '/.env')) {
     Dotenv\Dotenv::createImmutable(dirname(__DIR__))->safeLoad();
 }
 
+$testExporterFailure = getenv('IM_TEST_OTEL_FAILURE') === '1';
+if ($testExporterFailure) {
+    putenv('OTEL_TRACES_ENABLED=true');
+    putenv('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:9/v1/traces');
+    putenv('OTEL_EXPORTER_OTLP_TRACES_TIMEOUT=50');
+}
 $config = Config::fromEnv();
+if ($testExporterFailure) {
+    Telemetry::boot($config, 'b8im-im-mysql-integration');
+}
 $repository = ImRepository::connect($config);
 $expectedDatabase = trim((string) ($_ENV['IM_EXPECT_DATABASE'] ?? $_SERVER['IM_EXPECT_DATABASE'] ?? getenv('IM_EXPECT_DATABASE')));
 if ($expectedDatabase === '') {
@@ -170,6 +181,8 @@ try {
         'worker_id',
         'claim_token',
         'published_at',
+        'traceparent',
+        'tracestate',
     ], ['payload', 'next_retry_time', 'locked_time', 'published_time']);
 
     foreach ([$senderId, $recipientId, $otherId] as $userId) {
@@ -926,12 +939,21 @@ try {
         throw new RuntimeException('non-text message did not use URL-free canonical server asset metadata');
     }
     $assetOutbox = $repository->fetchOne(
-        'SELECT payload_json FROM im_message_outbox
+        'SELECT payload_json, traceparent, tracestate FROM im_message_outbox
           WHERE organization = 1 AND event_type = ? AND message_id = ? AND change_seq = 0
           LIMIT 1',
         [Constants::MQ_ROUTING_MESSAGE_CREATED, (string) $assetMessage['message']['message_id']],
     );
     $assetOutboxPayload = json_decode((string) ($assetOutbox['payload_json'] ?? ''), true, flags: JSON_THROW_ON_ERROR);
+    if ($testExporterFailure) {
+        $storedTrace = TraceContext::fromCarrier(
+            isset($assetOutbox['traceparent']) ? (string) $assetOutbox['traceparent'] : null,
+            isset($assetOutbox['tracestate']) ? (string) $assetOutbox['tracestate'] : null,
+        );
+        if ($storedTrace === null) {
+            throw new RuntimeException('failed OTLP exporter prevented durable outbox trace persistence');
+        }
+    }
     $assetOutboxContent = $assetOutboxPayload['message']['content'] ?? null;
     if (!is_array($assetOutboxContent)
         || array_key_exists('url', $assetOutboxContent)
@@ -1192,4 +1214,8 @@ try {
     $repository->execute('DELETE FROM im_user_privacy_setting WHERE organization = 1 AND user_id IN (?, ?, ?)', [$senderId, $recipientId, $otherId]);
     $repository->execute('DELETE FROM im_user_profile WHERE organization = 1 AND user_id IN (?, ?, ?)', [$senderId, $recipientId, $otherId]);
     $repository->execute('DELETE FROM im_user WHERE organization = 1 AND user_id IN (?, ?, ?)', [$senderId, $recipientId, $otherId]);
+    if ($testExporterFailure) {
+        Telemetry::flush();
+        Telemetry::shutdown();
+    }
 }

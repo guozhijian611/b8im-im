@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace B8im\ImBusiness\Realtime;
 
 use B8im\ImShared\Support\Constants;
+use B8im\ImBusiness\Telemetry\Telemetry;
+use OpenTelemetry\API\Trace\SpanKind;
 
 final class RealtimeDeliveryService implements RealtimeEventDeliverer
 {
@@ -17,14 +19,44 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
 
     public function deliver(RealtimeEvent $event): void
     {
-        $packet = $event->encodedPacket();
         foreach ($this->recipientUserIds($event) as $userId) {
             foreach ($this->gateway->clientIdsForOrganizationUser($event->organization, $userId) as $clientId) {
                 if ($clientId === $event->originClientId || $this->checkpoints->wasDelivered($event, $clientId)) {
                     continue;
                 }
-                $this->gateway->sendToClient($clientId, $packet);
-                $this->checkpoints->markDelivered($event, $clientId);
+                $trace = Telemetry::start(
+                    'im.gateway.push',
+                    SpanKind::KIND_PRODUCER,
+                    attributes: [
+                        'operation' => 'im.gateway.push',
+                        'b8im.organization' => $event->organization,
+                        'b8im.message_id' => $event->messageId,
+                        'b8im.event_id' => $event->eventId(),
+                    ],
+                );
+                try {
+                    $this->gateway->sendToClient(
+                        $clientId,
+                        $event->encodedPacket(Telemetry::currentTraceContext()),
+                    );
+                    $this->checkpoints->markDelivered($event, $clientId);
+                } catch (\Throwable $throwable) {
+                    Telemetry::recordError(
+                        $trace->span,
+                        $throwable,
+                        'IM_GATEWAY_PUSH_FAILED',
+                        'delivery',
+                        'im.gateway.push',
+                        [
+                            'retry_count' => 0,
+                            'b8im.message_id' => $event->messageId,
+                            'b8im.event_id' => $event->eventId(),
+                        ],
+                    );
+                    throw $throwable;
+                } finally {
+                    $trace->end();
+                }
             }
         }
     }

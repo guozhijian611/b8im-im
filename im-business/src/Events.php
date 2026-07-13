@@ -16,6 +16,8 @@ use B8im\ImBusiness\Auth\SessionResolver;
 use B8im\ImBusiness\Exception\ImException;
 use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Protocol\Command;
+use B8im\ImBusiness\Telemetry\Telemetry;
+use OpenTelemetry\API\Trace\SpanKind;
 use Workerman\Timer;
 
 /**
@@ -33,6 +35,11 @@ class Events
         Runtime::boot();
         self::startRealtimeEventConsumer();
         echo date('Y-m-d H:i:s') . " ImBusiness worker started\n";
+    }
+
+    public static function onWorkerStop($businessWorker): void
+    {
+        Telemetry::shutdown();
     }
 
     /** 客户端建立 TCP 连接时 WebSocket 握手尚未完成，不能发送业务帧。 */
@@ -68,6 +75,19 @@ class Events
             return;
         }
 
+        $trace = Telemetry::start(
+            'im.ws.' . $packet->cmd,
+            SpanKind::KIND_SERVER,
+            $packet->traceContext(),
+            [
+                'service' => 'b8im-im-business',
+                'operation' => 'im.ws.' . $packet->cmd,
+                'b8im.command' => $packet->cmd,
+                'b8im.client_msg_id' => (string) ($packet->clientMsgId ?? ''),
+                'b8im.message_id' => (string) ($packet->data['message_id'] ?? ''),
+                'b8im.conversation_id' => (string) ($packet->data['conversation_id'] ?? ''),
+            ],
+        );
         try {
             match ($packet->cmd) {
                 Command::AUTH => self::handleAuth($clientId, $packet),
@@ -86,6 +106,14 @@ class Events
             };
         } catch (ImException $exception) {
             $errorCode = $exception->errorCode();
+            Telemetry::recordError(
+                $trace->span,
+                $exception,
+                $errorCode,
+                'business',
+                'im.ws.' . $packet->cmd,
+                ['retry_count' => 0, 'b8im.client_msg_id' => (string) ($packet->clientMsgId ?? '')],
+            );
             self::sendError(
                 $clientId,
                 $errorCode,
@@ -97,7 +125,16 @@ class Events
                 Gateway::closeClient($clientId);
             }
         } catch (\Throwable $throwable) {
-            echo date('Y-m-d H:i:s') . ' IM error: ' . $throwable->getMessage() . "\n";
+            Telemetry::recordError(
+                $trace->span,
+                $throwable,
+                'IM_SERVER_ERROR',
+                'internal',
+                'im.ws.' . $packet->cmd,
+                ['retry_count' => 0, 'b8im.client_msg_id' => (string) ($packet->clientMsgId ?? '')],
+            );
+            echo date('Y-m-d H:i:s') . ' IM error: error_code=IM_SERVER_ERROR '
+                . Telemetry::logContext() . "\n";
             self::sendError(
                 $clientId,
                 'SERVER_ERROR',
@@ -108,6 +145,8 @@ class Events
             if ($packet->cmd === Command::AUTH) {
                 Gateway::closeClient($clientId);
             }
+        } finally {
+            $trace->end();
         }
     }
 
@@ -118,13 +157,28 @@ class Events
      */
     public static function onClose($clientId): void
     {
+        $trace = Telemetry::start('im.ws.close', attributes: [
+            'operation' => 'im.ws.close',
+            'b8im.client_id' => (string) $clientId,
+        ]);
         try {
             $connection = Runtime::connections()->unbind($clientId);
             if ($connection !== null) {
                 Runtime::devices()->offline($connection);
             }
         } catch (\Throwable $throwable) {
-            echo date('Y-m-d H:i:s') . ' IM close error: ' . $throwable->getMessage() . "\n";
+            Telemetry::recordError(
+                $trace->span,
+                $throwable,
+                'IM_CONNECTION_CLOSE_FAILED',
+                'internal',
+                'im.ws.close',
+                ['retry_count' => 0, 'b8im.client_id' => (string) $clientId],
+            );
+            echo date('Y-m-d H:i:s') . ' IM close error: error_code=IM_CONNECTION_CLOSE_FAILED '
+                . Telemetry::logContext() . "\n";
+        } finally {
+            $trace->end();
         }
     }
 
@@ -136,11 +190,23 @@ class Events
         }
 
         $token = (string) ($packet->data['token'] ?? '');
-        $context = Runtime::token()->verify($token, $clientId);
-        Runtime::authIdentities()->assertActive($context);
+        $context = Telemetry::run(
+            'im.auth.verify',
+            static fn () => Runtime::token()->verify($token, $clientId),
+            attributes: ['operation' => 'im.auth.verify'],
+        );
+        Telemetry::run(
+            'im.auth.identity',
+            static fn () => Runtime::authIdentities()->assertActive($context),
+            attributes: ['operation' => 'im.auth.identity', 'b8im.organization' => $context->organization],
+        );
         $context = $context->withSessionId(bin2hex(random_bytes(16)));
 
-        $decision = Runtime::tenantImPolicies()->authorizeAuth($context);
+        $decision = Telemetry::run(
+            'im.auth.tenant_policy',
+            static fn () => Runtime::tenantImPolicies()->authorizeAuth($context),
+            attributes: ['operation' => 'im.auth.tenant_policy', 'b8im.organization' => $context->organization],
+        );
 
         try {
             foreach ($decision->clientIdsToDisconnect as $oldClientId) {
@@ -163,7 +229,7 @@ class Events
 
         Gateway::sendToClient(
             $clientId,
-            Packet::make(Command::AUTH_ACK, [
+            self::responsePacket(Command::AUTH_ACK, [
                 'ok' => true,
                 'user_id' => $context->userId,
                 'device_id' => $context->deviceId,
@@ -184,26 +250,45 @@ class Events
     {
         $context = self::requireContext($clientId);
         Runtime::connections()->touch($clientId);
-        Gateway::sendToClient($clientId, Packet::make(Command::PONG, [], $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::PONG, [], $context->organization)->encode());
     }
 
     private static function handleSend(string $clientId, Packet $packet): void
     {
         $context = self::requireContext($clientId);
-        $permit = Runtime::tenantImPolicies()->acquireSendPermit(
-            $context->organization,
-            $context->userId,
-            $context->clientFamily,
+        $permit = Telemetry::run(
+            'im.send.tenant_policy',
+            static fn () => Runtime::tenantImPolicies()->acquireSendPermit(
+                $context->organization,
+                $context->userId,
+                $context->clientFamily,
+            ),
+            attributes: ['operation' => 'im.send.tenant_policy', 'b8im.organization' => $context->organization],
         );
         try {
-            $result = Runtime::messages()->send($context, $packet->withServerOrganization($context->organization));
+            $result = Telemetry::run(
+                'im.send',
+                static fn () => Runtime::messages()->send($context, $packet->withServerOrganization($context->organization)),
+                attributes: [
+                    'operation' => 'im.send',
+                    'b8im.organization' => $context->organization,
+                    'b8im.client_msg_id' => (string) ($packet->clientMsgId ?? ''),
+                ],
+            );
         } finally {
             $permit->release();
         }
 
+        Telemetry::setCurrentAttributes([
+            'b8im.organization' => $context->organization,
+            'b8im.message_id' => (string) $result['message']['message_id'],
+            'b8im.conversation_id' => (string) $result['message']['conversation_id'],
+            'b8im.client_msg_id' => (string) $result['message']['client_msg_id'],
+        ]);
+
         Gateway::sendToClient(
             $clientId,
-            Packet::make(Command::SEND_ACK, [
+            self::responsePacket(Command::SEND_ACK, [
                 'ok' => true,
                 'duplicated' => $result['duplicated'],
                 'organization' => $context->organization,
@@ -221,12 +306,12 @@ class Events
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->ack($context, $packet->data);
-        Gateway::sendToClient($clientId, Packet::make(Command::ACK_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::ACK_ACK, $result, $context->organization)->encode());
 
         if ((string) $result['sender_id'] !== $context->userId) {
             Gateway::sendToUid(
                 AuthContext::uidFor($context->organization, (string) $result['sender_id']),
-                Packet::make(Command::ACK, $result, $context->organization)->encode()
+                self::responsePacket(Command::ACK, $result, $context->organization)->encode()
             );
         }
     }
@@ -235,35 +320,35 @@ class Events
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->recall($context, $packet->data);
-        Gateway::sendToClient($clientId, Packet::make(Command::RECALL_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::RECALL_ACK, $result, $context->organization)->encode());
     }
 
     private static function handleEdit(string $clientId, Packet $packet): void
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->edit($context, $packet->data);
-        Gateway::sendToClient($clientId, Packet::make(Command::EDIT_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::EDIT_ACK, $result, $context->organization)->encode());
     }
 
     private static function handleDelete(string $clientId, Packet $packet): void
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->delete($context, $packet->data);
-        Gateway::sendToClient($clientId, Packet::make(Command::DELETE_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::DELETE_ACK, $result, $context->organization)->encode());
     }
 
     private static function handleScreenshot(string $clientId, Packet $packet): void
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->screenshot($context, $packet->data);
-        Gateway::sendToClient($clientId, Packet::make(Command::SCREENSHOT_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::SCREENSHOT_ACK, $result, $context->organization)->encode());
     }
 
     private static function handleSync(string $clientId, Packet $packet): void
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->sync($context, $packet->data);
-        Gateway::sendToClient($clientId, Packet::make(Command::SYNC_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient($clientId, self::responsePacket(Command::SYNC_ACK, $result, $context->organization)->encode());
     }
 
     private static function handleTyping(string $clientId, Packet $packet): void
@@ -284,7 +369,7 @@ class Events
         $result = Runtime::presence()->query($context, $userIds);
         Gateway::sendToClient(
             $clientId,
-            Packet::make(Command::PRESENCE_ACK, $result, $context->organization)->encode()
+            self::responsePacket(Command::PRESENCE_ACK, $result, $context->organization)->encode()
         );
     }
 
@@ -297,7 +382,7 @@ class Events
         $result = Runtime::conversationSync()->markRead($context, $clientId, $conversationId, $lastReadMessageId);
         Gateway::sendToClient(
             $clientId,
-            Packet::make(Command::CONVERSATION_READ_ACK, $result, $context->organization)->encode()
+            self::responsePacket(Command::CONVERSATION_READ_ACK, $result, $context->organization)->encode()
         );
     }
 
@@ -324,7 +409,20 @@ class Events
             try {
                 Runtime::realtimeEvents()->consume();
             } catch (\Throwable $throwable) {
-                echo date('Y-m-d H:i:s') . ' IM realtime event error: ' . $throwable->getMessage() . "\n";
+                $trace = Telemetry::start('im.realtime.control.consume', attributes: [
+                    'operation' => 'im.realtime.control.consume',
+                ]);
+                Telemetry::recordError(
+                    $trace->span,
+                    $throwable,
+                    'IM_REALTIME_CONTROL_CONSUMER_FAILED',
+                    'infrastructure',
+                    'im.realtime.control.consume',
+                    ['retry_count' => 0],
+                );
+                echo date('Y-m-d H:i:s') . ' IM realtime event error: error_code=IM_REALTIME_CONTROL_CONSUMER_FAILED '
+                    . Telemetry::logContext() . "\n";
+                $trace->end();
             }
         });
     }
@@ -357,7 +455,22 @@ class Events
     {
         Gateway::sendToClient(
             $clientId,
-            Packet::make(Command::ERROR, ['code' => $code, 'msg' => $message], $organization, $clientMsgId)->encode()
+            self::responsePacket(Command::ERROR, ['code' => $code, 'msg' => $message], $organization, $clientMsgId)->encode()
+        );
+    }
+
+    private static function responsePacket(
+        string $command,
+        array $data = [],
+        int $organization = 0,
+        ?string $clientMsgId = null,
+    ): Packet {
+        return Packet::make(
+            $command,
+            $data,
+            $organization,
+            $clientMsgId,
+            Telemetry::currentTraceContext(),
         );
     }
 }

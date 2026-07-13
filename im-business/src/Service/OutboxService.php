@@ -12,6 +12,8 @@ use B8im\ImBusiness\Auth\AuthContext;
 use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Repository\ImRepository;
 use B8im\ImShared\Support\Constants;
+use B8im\ImBusiness\Telemetry\Telemetry;
+use OpenTelemetry\API\Trace\SpanKind;
 
 final class OutboxService
 {
@@ -47,22 +49,40 @@ final class OutboxService
             'created_at' => (string) $message['create_time'],
         ];
 
-        $this->repository->execute(
-            'INSERT INTO im_message_outbox
-                (organization, event_type, routing_key, message_id, change_seq, conversation_id, conversation_type, payload_json, status, retry_count, next_retry_at, create_time, update_time)
-             VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?)',
+        Telemetry::run(
+            'im.outbox.insert',
+            function () use ($context, $message, $payload, $now): int {
+                $trace = Telemetry::currentTraceContext();
+                return $this->repository->execute(
+                    'INSERT INTO im_message_outbox
+                        (organization, event_type, routing_key, message_id, change_seq, conversation_id, conversation_type, payload_json, traceparent, tracestate, status, retry_count, next_retry_at, create_time, update_time)
+                     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+                    [
+                        $context->organization,
+                        Constants::MQ_ROUTING_MESSAGE_CREATED,
+                        Constants::MQ_ROUTING_MESSAGE_CREATED,
+                        (string) $message['message_id'],
+                        (string) $message['conversation_id'],
+                        (int) $message['conversation_type'],
+                        json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+                        $trace?->traceparent,
+                        $trace?->tracestate,
+                        self::STATUS_PENDING,
+                        $now,
+                        $now,
+                        $now,
+                    ],
+                );
+            },
+            SpanKind::KIND_CLIENT,
             [
-                $context->organization,
-                Constants::MQ_ROUTING_MESSAGE_CREATED,
-                Constants::MQ_ROUTING_MESSAGE_CREATED,
-                (string) $message['message_id'],
-                (string) $message['conversation_id'],
-                (int) $message['conversation_type'],
-                json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-                self::STATUS_PENDING,
-                $now,
-                $now,
-                $now,
+                'operation' => 'im.outbox.insert',
+                'db.system.name' => 'mysql',
+                'db.operation.name' => 'INSERT',
+                'db.collection.name' => 'im_message_outbox',
+                'b8im.organization' => $context->organization,
+                'b8im.message_id' => (string) $message['message_id'],
+                'messaging.destination.name' => Constants::MQ_ROUTING_MESSAGE_CREATED,
             ],
         );
     }
@@ -102,23 +122,41 @@ final class OutboxService
             'created_at' => $now,
         ];
 
-        $this->repository->execute(
-            'INSERT INTO im_message_outbox
-                (organization, event_type, routing_key, message_id, change_seq, conversation_id, conversation_type, payload_json, status, retry_count, next_retry_at, create_time, update_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+        Telemetry::run(
+            'im.outbox.insert',
+            function () use ($context, $eventType, $messageId, $changeSeq, $conversationId, $conversationType, $eventPayload, $now): int {
+                $trace = Telemetry::currentTraceContext();
+                return $this->repository->execute(
+                    'INSERT INTO im_message_outbox
+                        (organization, event_type, routing_key, message_id, change_seq, conversation_id, conversation_type, payload_json, traceparent, tracestate, status, retry_count, next_retry_at, create_time, update_time)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+                    [
+                        $context->organization,
+                        $eventType,
+                        $eventType,
+                        $messageId,
+                        $changeSeq,
+                        $conversationId,
+                        $conversationType,
+                        json_encode($eventPayload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+                        $trace?->traceparent,
+                        $trace?->tracestate,
+                        self::STATUS_PENDING,
+                        $now,
+                        $now,
+                        $now,
+                    ],
+                );
+            },
+            SpanKind::KIND_CLIENT,
             [
-                $context->organization,
-                $eventType,
-                $eventType,
-                $messageId,
-                $changeSeq,
-                $conversationId,
-                $conversationType,
-                json_encode($eventPayload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-                self::STATUS_PENDING,
-                $now,
-                $now,
-                $now,
+                'operation' => 'im.outbox.insert',
+                'db.system.name' => 'mysql',
+                'db.operation.name' => 'INSERT',
+                'db.collection.name' => 'im_message_outbox',
+                'b8im.organization' => $context->organization,
+                'b8im.message_id' => $messageId,
+                'messaging.destination.name' => $eventType,
             ],
         );
     }

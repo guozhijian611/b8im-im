@@ -6,6 +6,7 @@ use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Repository\ImRepository;
 use B8im\ImShared\Support\Constants;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
+use B8im\ImShared\Telemetry\TraceContext;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
@@ -103,7 +104,7 @@ if (count($offlineRows) !== 2
 $deadline = microtime(true) + max(1, (int) $env('QA_OUTBOX_WAIT_SECONDS', '20'));
 do {
     $outboxRows = $repository->fetchAll(
-        'SELECT message_id, status, retry_count, worker_id, claim_token, published_at, last_error
+        'SELECT message_id, status, retry_count, worker_id, claim_token, published_at, last_error, traceparent, tracestate
            FROM im_message_outbox WHERE organization = ? AND event_type = ? AND change_seq = 0
             AND message_id IN (' . $placeholders . ')',
         [$organization, Constants::MQ_ROUTING_MESSAGE_CREATED, ...$messageIds],
@@ -125,6 +126,26 @@ if (!$published) {
 foreach ($outboxRows as $row) {
     if ((int) $row['retry_count'] > (int) $env('QA_OUTBOX_MAX_RETRY_COUNT', '0') || trim((string) $row['last_error']) !== '') {
         $fail('outbox retry/error detected for ' . $row['message_id']);
+    }
+    try {
+        $trace = TraceContext::fromCarrier(
+            isset($row['traceparent']) ? (string) $row['traceparent'] : null,
+            isset($row['tracestate']) ? (string) $row['tracestate'] : null,
+        );
+    } catch (InvalidArgumentException $exception) {
+        $fail('outbox trace context is invalid for ' . $row['message_id']);
+    }
+    if ($trace === null) {
+        $fail('outbox trace context is missing for ' . $row['message_id']);
+    }
+    $manifestMessage = array_values(array_filter(
+        $messages,
+        static fn (array $message): bool => (string) $message['message_id'] === (string) $row['message_id'],
+    ))[0] ?? null;
+    if (is_array($manifestMessage)
+        && isset($manifestMessage['trace_id'])
+        && $trace->traceId() !== (string) $manifestMessage['trace_id']) {
+        $fail('outbox trace_id differs from the originating SEND for ' . $row['message_id']);
     }
 }
 

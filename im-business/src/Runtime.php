@@ -23,6 +23,7 @@ use B8im\ImBusiness\Service\PresenceService;
 use B8im\ImBusiness\Service\RealtimeEventConsumer;
 use B8im\ImBusiness\Service\TypingService;
 use B8im\ImBusiness\Service\TenantImPolicyService;
+use B8im\ImBusiness\Telemetry\Telemetry;
 
 final class Runtime
 {
@@ -44,6 +45,7 @@ final class Runtime
     public static function boot(): void
     {
         $config = Config::fromEnv();
+        Telemetry::boot($config, 'b8im-im-business');
         $repository = ImRepository::connect($config);
 
         self::$config = $config;

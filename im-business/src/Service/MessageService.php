@@ -13,6 +13,8 @@ use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Exception\ImException;
 use B8im\ImBusiness\Repository\ImRepository;
 use B8im\ImShared\Protocol\MessageType;
+use B8im\ImBusiness\Telemetry\Telemetry;
+use OpenTelemetry\API\Trace\SpanKind;
 use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Support\Constants;
 use PDOException;
@@ -87,81 +89,104 @@ final class MessageService
         $this->ensureOrganizationSequence($context->organization);
         $messageTable = $this->messageShardRouter->writeTable($context->organization, (string) $data['conversation_id'], $now);
         try {
-            return $this->repository->transaction(function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTable, $now): array {
-                $conversation = $conversationType === self::CONVERSATION_SINGLE
-                    ? $this->ensureSingleConversation($context, $data)
-                    : $this->ensureGroupConversation($context, $data);
+            return Telemetry::run(
+                'im.message.persist',
+                function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTable, $now): array {
+                    return $this->repository->transaction(function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTable, $now): array {
+                        $conversation = $conversationType === self::CONVERSATION_SINGLE
+                            ? $this->ensureSingleConversation($context, $data)
+                            : $this->ensureGroupConversation($context, $data);
 
-                $messageSeq = $this->allocateMessageSeq($context->organization, $conversation['conversation_id']);
-                $messageId = $this->newMessageId();
-                $contentJson = json_encode($content, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
-                $summary = $this->summary($messageType, $content);
+                        $messageSeq = $this->allocateMessageSeq($context->organization, $conversation['conversation_id']);
+                        $messageId = $this->newMessageId();
+                        $contentJson = json_encode($content, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+                        $summary = $this->summary($messageType, $content);
 
-                $this->repository->execute(
-                    'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
+                        Telemetry::run(
+                            'im.message.body.insert',
+                            fn () => $this->repository->execute(
+                                'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
                         (organization, conversation_id, conversation_type, message_id, message_seq, client_msg_id, sender_id, message_type, content, status, create_time, update_time)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [
-                        $context->organization,
-                        $conversation['conversation_id'],
-                        $conversationType,
-                        $messageId,
-                        $messageSeq,
-                        $clientMsgId,
-                        $context->userId,
-                        $messageType,
-                        $contentJson,
-                        self::MESSAGE_NORMAL,
-                        $now,
-                        $now,
-                    ],
-                );
+                                [
+                                    $context->organization,
+                                    $conversation['conversation_id'],
+                                    $conversationType,
+                                    $messageId,
+                                    $messageSeq,
+                                    $clientMsgId,
+                                    $context->userId,
+                                    $messageType,
+                                    $contentJson,
+                                    self::MESSAGE_NORMAL,
+                                    $now,
+                                    $now,
+                                ],
+                            ),
+                            SpanKind::KIND_CLIENT,
+                            [
+                                'operation' => 'im.message.body.insert',
+                                'db.system.name' => 'mysql',
+                                'db.operation.name' => 'INSERT',
+                                'db.collection.name' => $messageTable,
+                                'b8im.organization' => $context->organization,
+                                'b8im.message_id' => $messageId,
+                            ],
+                        );
 
-                $messageRow = $this->repository->fetchOne(
-                    'SELECT * FROM ' . $this->messageShardRouter->quote($messageTable) . ' WHERE organization = ? AND message_id = ? LIMIT 1',
-                    [$context->organization, $messageId],
-                );
-                if ($messageRow === null) {
-                    throw new ImException('消息写入失败', 'SEND_MESSAGE_CREATE_FAILED');
-                }
-                $messageRow['_message_table'] = $messageTable;
+                        $messageRow = $this->repository->fetchOne(
+                            'SELECT * FROM ' . $this->messageShardRouter->quote($messageTable) . ' WHERE organization = ? AND message_id = ? LIMIT 1',
+                            [$context->organization, $messageId],
+                        );
+                        if ($messageRow === null) {
+                            throw new ImException('消息写入失败', 'SEND_MESSAGE_CREATE_FAILED');
+                        }
+                        $messageRow['_message_table'] = $messageTable;
 
-                $recipientUserIds = $conversation['recipient_user_ids'];
-                $this->createReceipts($context, $conversation['conversation_id'], $messageId, $recipientUserIds);
-                $this->increaseUnread($context->organization, $conversation['conversation_id'], $recipientUserIds);
-                $this->repository->execute(
-                    'UPDATE im_conversation
+                        $recipientUserIds = $conversation['recipient_user_ids'];
+                        $this->createReceipts($context, $conversation['conversation_id'], $messageId, $recipientUserIds);
+                        $this->increaseUnread($context->organization, $conversation['conversation_id'], $recipientUserIds);
+                        $this->repository->execute(
+                            'UPDATE im_conversation
                         SET last_message_id = ?, last_message_seq = ?, last_message_time = ?, last_message_summary = ?, update_time = ?
                       WHERE organization = ? AND conversation_id = ?',
-                    [$messageId, $messageSeq, $now, $summary, $now, $context->organization, $conversation['conversation_id']],
-                );
+                            [$messageId, $messageSeq, $now, $summary, $now, $context->organization, $conversation['conversation_id']],
+                        );
 
-                $globalSeq = $this->allocateGlobalSeq($context->organization);
-                $this->createMessageIndex(
-                    organization: $context->organization,
-                    conversationId: $conversation['conversation_id'],
-                    messageId: $messageId,
-                    messageSeq: $messageSeq,
-                    globalSeq: $globalSeq,
-                    senderId: $context->userId,
-                    clientMsgId: $clientMsgId,
-                    messageTable: $messageTable,
-                    now: $now,
-                );
-                $messageRow['global_seq'] = (string) $globalSeq;
+                        $globalSeq = $this->allocateGlobalSeq($context->organization);
+                        $this->createMessageIndex(
+                            organization: $context->organization,
+                            conversationId: $conversation['conversation_id'],
+                            messageId: $messageId,
+                            messageSeq: $messageSeq,
+                            globalSeq: $globalSeq,
+                            senderId: $context->userId,
+                            clientMsgId: $clientMsgId,
+                            messageTable: $messageTable,
+                            now: $now,
+                        );
+                        $messageRow['global_seq'] = (string) $globalSeq;
 
-                $this->outbox->createMessageCreated(
-                    $context,
-                    $this->formatMessage($messageRow),
-                    $recipientUserIds,
-                );
+                        $this->outbox->createMessageCreated(
+                            $context,
+                            $this->formatMessage($messageRow),
+                            $recipientUserIds,
+                        );
 
-                return [
-                    'duplicated' => false,
-                    'message' => $this->formatMessage($messageRow),
-                    'recipient_user_ids' => $recipientUserIds,
-                ];
-            });
+                        return [
+                            'duplicated' => false,
+                            'message' => $this->formatMessage($messageRow),
+                            'recipient_user_ids' => $recipientUserIds,
+                        ];
+                    });
+                },
+                attributes: [
+                    'operation' => 'im.message.persist',
+                    'b8im.organization' => $context->organization,
+                    'b8im.client_msg_id' => $clientMsgId,
+                    'b8im.conversation_id' => (string) $data['conversation_id'],
+                ],
+            );
         } catch (PDOException $exception) {
             if ($this->isClientMessageIdempotencyConflict($exception)) {
                 $message = $this->findMessageByClientMsg($context->organization, $context->userId, $clientMsgId);
@@ -668,8 +693,10 @@ final class MessageService
         string $messageTable,
         string $now,
     ): void {
-        $this->repository->execute(
-            'INSERT INTO `im_message_index`
+        Telemetry::run(
+            'im.message.index.insert',
+            fn () => $this->repository->execute(
+                'INSERT INTO `im_message_index`
                 (organization, global_seq, message_id, conversation_id, message_seq,
                  sender_id, client_msg_id, storage_node, shard_table, create_time)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -684,6 +711,17 @@ final class MessageService
                 'mysql-primary',
                 $messageTable,
                 $now,
+                ],
+            ),
+            SpanKind::KIND_CLIENT,
+            [
+                'operation' => 'im.message.index.insert',
+                'db.system.name' => 'mysql',
+                'db.operation.name' => 'INSERT',
+                'db.collection.name' => 'im_message_index',
+                'b8im.organization' => $organization,
+                'b8im.message_id' => $messageId,
+                'b8im.conversation_id' => $conversationId,
             ],
         );
     }

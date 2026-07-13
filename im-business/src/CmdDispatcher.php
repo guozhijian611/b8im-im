@@ -10,6 +10,7 @@ namespace B8im\ImBusiness;
 
 use B8im\ImShared\Protocol\CmdHandlerInterface;
 use B8im\ImShared\Protocol\Packet;
+use B8im\ImBusiness\Telemetry\Telemetry;
 
 /**
  * 模块 cmd 分发器
@@ -78,9 +79,25 @@ final class CmdDispatcher
         }
 
         if ($entry['guard'] !== null) {
-            ($entry['guard'])($organization);
+            Telemetry::run(
+                'im.module.license',
+                static fn () => ($entry['guard'])($organization),
+                attributes: [
+                    'operation' => 'im.module.license',
+                    'b8im.organization' => $organization,
+                    'b8im.command' => $packet->cmd,
+                ],
+            );
         }
 
-        $entry['handler']->handle($clientId, $packet->withServerOrganization($organization));
+        Telemetry::run(
+            'im.module.dispatch',
+            static fn () => $entry['handler']->handle($clientId, $packet->withServerOrganization($organization)),
+            attributes: [
+                'operation' => 'im.module.dispatch',
+                'b8im.organization' => $organization,
+                'b8im.command' => $packet->cmd,
+            ],
+        );
     }
 }

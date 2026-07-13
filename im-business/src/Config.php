@@ -52,6 +52,14 @@ final class Config
         public readonly int $messageShardBuckets,
         public readonly int $moduleLicenseCacheTtlSeconds,
         public readonly int $authRevalidateTtlSeconds,
+        public readonly bool $otelEnabled,
+        public readonly string $otelTracesEndpoint,
+        public readonly int $otelExporterTimeoutMs,
+        public readonly int $otelBatchScheduleDelayMs,
+        public readonly int $otelBatchMaxQueueSize,
+        public readonly int $otelBatchMaxExportSize,
+        public readonly string $otelServiceVersion,
+        public readonly string $otelEnvironment,
     ) {
     }
 
@@ -100,6 +108,14 @@ final class Config
             messageShardBuckets: min(1024, max(1, (int) self::env('IM_MESSAGE_SHARD_BUCKETS', '64'))),
             moduleLicenseCacheTtlSeconds: min(300, max(1, (int) self::env('IM_MODULE_LICENSE_CACHE_TTL_SECONDS', '60'))),
             authRevalidateTtlSeconds: min(30, max(1, (int) self::env('IM_AUTH_REVALIDATE_TTL_SECONDS', '3'))),
+            otelEnabled: self::boolEnv('OTEL_TRACES_ENABLED', false),
+            otelTracesEndpoint: self::env('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', 'http://otel-collector:4318/v1/traces'),
+            otelExporterTimeoutMs: min(1000, max(50, (int) self::env('OTEL_EXPORTER_OTLP_TRACES_TIMEOUT', '200'))),
+            otelBatchScheduleDelayMs: min(10000, max(250, (int) self::env('OTEL_BSP_SCHEDULE_DELAY_MS', '1000'))),
+            otelBatchMaxQueueSize: min(8192, max(512, (int) self::env('OTEL_BSP_MAX_QUEUE_SIZE', '2048'))),
+            otelBatchMaxExportSize: min(512, max(16, (int) self::env('OTEL_BSP_MAX_EXPORT_BATCH_SIZE', '256'))),
+            otelServiceVersion: self::otelServiceVersion(),
+            otelEnvironment: self::env('OTEL_DEPLOYMENT_ENVIRONMENT', 'local'),
         );
     }
 
@@ -123,6 +139,15 @@ final class Config
         $value = self::env($key, $default ? 'true' : 'false');
 
         return in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private static function otelServiceVersion(): string
+    {
+        $version = trim(self::env('OTEL_SERVICE_VERSION', 'dev'));
+
+        return preg_match('/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/D', $version) === 1
+            ? $version
+            : 'unknown';
     }
 
     /**

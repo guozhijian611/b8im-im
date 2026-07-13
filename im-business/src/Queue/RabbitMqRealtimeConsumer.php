@@ -13,6 +13,9 @@ use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
 use Throwable;
+use B8im\ImBusiness\Telemetry\Telemetry;
+use B8im\ImShared\Telemetry\TraceContext;
+use OpenTelemetry\API\Trace\SpanKind;
 
 final class RabbitMqRealtimeConsumer
 {
@@ -88,31 +91,104 @@ final class RabbitMqRealtimeConsumer
 
     private function consume(AMQPMessage $message): void
     {
-        $result = $this->handler->handle($message->getRoutingKey(), $message->getBody());
+        $headers = $message->has('application_headers')
+            ? $message->get('application_headers')->getNativeData()
+            : [];
+        $parent = null;
+        try {
+            $parent = TraceContext::fromCarrier(
+                isset($headers['traceparent']) ? (string) $headers['traceparent'] : null,
+                isset($headers['tracestate']) ? (string) $headers['tracestate'] : null,
+            );
+        } catch (\InvalidArgumentException) {
+        }
         $messageId = $message->has('message_id') ? (string) $message->get('message_id') : 'unknown';
+        $trace = Telemetry::start(
+            'im.rabbitmq.consume ' . $message->getRoutingKey(),
+            SpanKind::KIND_CONSUMER,
+            $parent,
+            [
+                'operation' => 'im.rabbitmq.consume',
+                'messaging.system' => 'rabbitmq',
+                'messaging.destination.name' => $message->getRoutingKey(),
+                'messaging.message.id' => $messageId,
+                'b8im.organization' => (int) ($headers['organization'] ?? 0),
+            ],
+        );
+        try {
+            $result = $this->handler->handle($message->getRoutingKey(), $message->getBody());
+        } catch (Throwable $throwable) {
+            Telemetry::recordError(
+                $trace->span,
+                $throwable,
+                'IM_REALTIME_CONSUMER_FAILED',
+                'messaging',
+                'im.rabbitmq.consume',
+                ['retry_count' => 0, 'messaging.message.id' => $messageId],
+            );
+            $trace->end();
+            throw $throwable;
+        }
 
         if ($result->outcome === RealtimeDeliveryResult::ACK) {
-            $message->ack();
+            try {
+                $message->ack();
+            } catch (Throwable $throwable) {
+                Telemetry::recordError(
+                    $trace->span,
+                    $throwable,
+                    'IM_RABBITMQ_ACK_FAILED',
+                    'messaging',
+                    'im.rabbitmq.consume',
+                    ['retry_count' => 0, 'messaging.message.id' => $messageId],
+                );
+                throw $throwable;
+            } finally {
+                $trace->end();
+            }
             return;
         }
 
+        Telemetry::recordError(
+            $trace->span,
+            new \RuntimeException($result->outcome),
+            $result->outcome === RealtimeDeliveryResult::REQUEUE
+                ? 'IM_REALTIME_DELIVERY_RETRY'
+                : 'IM_REALTIME_DELIVERY_DEAD_LETTER',
+            'messaging',
+            'im.rabbitmq.consume',
+            ['retry_count' => $result->attempt, 'messaging.message.id' => $messageId],
+        );
+
+        $errorCode = $result->outcome === RealtimeDeliveryResult::REQUEUE
+            ? 'IM_REALTIME_DELIVERY_RETRY'
+            : 'IM_REALTIME_DELIVERY_DEAD_LETTER';
         $line = sprintf(
-            '%s IM realtime delivery %s: message_id=%s routing_key=%s attempt=%d reason=%s',
+            '%s IM realtime delivery %s: error_code=%s message_id=%s routing_key=%s attempt=%d %s',
             date('Y-m-d H:i:s'),
             $result->outcome,
+            $errorCode,
             $messageId,
             $message->getRoutingKey(),
             $result->attempt,
-            mb_substr($result->reason, 0, 500),
+            Telemetry::logContext(),
         );
         echo $line . PHP_EOL;
 
         if ($result->outcome === RealtimeDeliveryResult::REQUEUE) {
-            $message->nack(true);
+            try {
+                $message->nack(true);
+            } finally {
+                $trace->end();
+            }
             return;
         }
 
-        $message->reject(false);
+        try {
+            $message->reject(false);
+        } finally {
+            $trace->end();
+        }
     }
 
     private function declareTopology(AMQPChannel $channel): void

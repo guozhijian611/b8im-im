@@ -16,6 +16,7 @@ use B8im\ImBusiness\Realtime\RedisRealtimeRetryCounter;
 use B8im\ImBusiness\Repository\ImRepository;
 use Throwable;
 use Workerman\Timer;
+use B8im\ImBusiness\Telemetry\Telemetry;
 
 final class RealtimeDeliveryProcess
 {
@@ -29,6 +30,7 @@ final class RealtimeDeliveryProcess
 
     public function start(): void
     {
+        Telemetry::boot($this->config, 'b8im-im-realtime');
         Timer::add($this->config->mqRealtimePollIntervalMs / 1000, function (): void {
             $this->tick();
         });
@@ -41,6 +43,7 @@ final class RealtimeDeliveryProcess
     public function stop(): void
     {
         $this->consumer?->close();
+        Telemetry::shutdown();
     }
 
     private function tick(): void
@@ -55,14 +58,27 @@ final class RealtimeDeliveryProcess
             $this->consumer->poll();
             $this->retryAfter = 0.0;
         } catch (Throwable $throwable) {
+            $trace = Telemetry::start('im.rabbitmq.poll', attributes: [
+                'operation' => 'im.rabbitmq.poll',
+                'retry_count' => 0,
+            ]);
+            Telemetry::recordError(
+                $trace->span,
+                $throwable,
+                'IM_RABBITMQ_CONSUMER_CONNECTION_FAILED',
+                'infrastructure',
+                'im.rabbitmq.poll',
+                ['retry_count' => 0],
+            );
             $this->consumer?->close();
             $this->consumer = null;
             $this->retryAfter = microtime(true) + 1.0;
             echo sprintf(
-                "%s IM realtime consumer connection error: %s\n",
+                "%s IM realtime consumer connection error: error_code=IM_RABBITMQ_CONSUMER_CONNECTION_FAILED %s\n",
                 date('Y-m-d H:i:s'),
-                mb_substr($throwable->getMessage(), 0, 500),
+                Telemetry::logContext(),
             );
+            $trace->end();
         } finally {
             $this->polling = false;
         }
