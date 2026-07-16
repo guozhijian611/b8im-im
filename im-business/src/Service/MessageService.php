@@ -2183,20 +2183,35 @@ final class MessageService
             return null;
         }
 
+        // Prefer same-org / platform system user; fall back to any-org peer for dual-home cross-org messages.
         $row = $this->repository->fetchOne(
-            'SELECT u.id, u.user_id, u.account, u.nickname, p.signature, u.avatar, u.mobile,
-                    u.im_short_no, u.gender, u.status, u.remark, u.login_time, u.is_system, u.system_code
+            'SELECT u.id, u.organization, u.user_id, u.account, u.nickname, p.signature, u.avatar, u.mobile,
+                    u.im_short_no, u.gender, u.status, u.remark, u.login_time, u.is_system, u.system_code,
+                    COALESCE(org.organization_name, org.title, "") AS organization_name
                FROM im_user u
                LEFT JOIN im_user_profile p
                  ON p.organization = u.organization
                 AND p.user_id = u.user_id
                 AND p.status = 1
                 AND p.delete_time IS NULL
+               LEFT JOIN sm_system_organization org
+                 ON org.id = u.organization
+                AND org.delete_time IS NULL
               WHERE u.user_id = ?
                 AND u.delete_time IS NULL
-                AND ((u.organization = ? AND u.is_system = 2) OR (u.organization = 0 AND u.is_system = 1))
+                AND (
+                    (u.organization = ? AND u.is_system = 2)
+                    OR (u.organization = 0 AND u.is_system = 1)
+                    OR (u.is_system = 2 AND u.status = 1)
+                )
+           ORDER BY CASE
+                        WHEN u.organization = ? AND u.is_system = 2 THEN 0
+                        WHEN u.organization = 0 AND u.is_system = 1 THEN 1
+                        ELSE 2
+                    END,
+                    u.id ASC
               LIMIT 1',
-            [$senderId, $organization],
+            [$senderId, $organization, $organization],
         );
         if ($row === null) {
             return null;
@@ -2208,11 +2223,29 @@ final class MessageService
             throw new ImException('消息发送者头像引用无效', 'IM_AVATAR_FILE_ID_INVALID');
         }
 
+        $senderOrganization = (int) ($row['organization'] ?? 0);
+        $companyName = trim((string) ($row['organization_name'] ?? ''));
+        $isCrossOrg = $senderOrganization > 0
+            && $organization > 0
+            && $senderOrganization !== $organization
+            && (int) ($row['is_system'] ?? 2) === 2;
+        $nickname = (string) ($row['nickname'] ?? '');
+        $account = (string) ($row['account'] ?? '');
+        $baseName = $nickname !== '' ? $nickname : ($account !== '' ? $account : '用户');
+        $displayName = $isCrossOrg && $companyName !== ''
+            ? $baseName . ' · ' . $companyName
+            : $baseName;
+
         return [
             'id' => (string) ($row['id'] ?? ''),
             'user_id' => (string) ($row['user_id'] ?? ''),
-            'account' => (string) ($row['account'] ?? ''),
-            'nickname' => (string) ($row['nickname'] ?? ''),
+            'account' => $account,
+            'nickname' => $nickname,
+            'display_name' => $displayName,
+            'organization' => $senderOrganization,
+            'organization_name' => $isCrossOrg ? $companyName : '',
+            'company_name' => $isCrossOrg ? $companyName : '',
+            'is_cross_organization' => $isCrossOrg,
             'signature' => (string) ($row['signature'] ?? ''),
             'avatar_file_id' => $avatarFileId,
             // 签名 URL 只能由受认证的 Server HTTP 投影生成，IM 不持有对象存储签名能力。
