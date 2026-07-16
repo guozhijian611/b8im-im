@@ -20,7 +20,11 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
     public function deliver(RealtimeEvent $event): void
     {
         foreach ($this->recipientUserIds($event) as $userId) {
-            foreach ($this->gateway->clientIdsForOrganizationUser($event->organization, $userId) as $clientId) {
+            $homeOrganization = (int) ($event->recipientHomes[$userId] ?? $event->organization);
+            if ($homeOrganization <= 0) {
+                $homeOrganization = $event->organization;
+            }
+            foreach ($this->gateway->clientIdsForOrganizationUser($homeOrganization, $userId) as $clientId) {
                 if ($clientId === $event->originClientId || $this->checkpoints->wasDelivered($event, $clientId)) {
                     continue;
                 }

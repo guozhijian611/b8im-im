@@ -28,9 +28,22 @@ final class OutboxService
     ) {
     }
 
-    public function createMessageCreated(AuthContext $context, array $message, array $recipientUserIds): void
-    {
+    /**
+     * @param list<string> $recipientUserIds
+     * @param array<string, int> $recipientHomes user_id => home organization
+     */
+    public function createMessageCreated(
+        AuthContext $context,
+        array $message,
+        array $recipientUserIds,
+        array $recipientHomes = [],
+    ): void {
         $now = $this->now();
+        $homes = [];
+        foreach ($recipientUserIds as $userId) {
+            $uid = (string) $userId;
+            $homes[$uid] = (int) ($recipientHomes[$uid] ?? $context->organization);
+        }
         $payload = [
             'event_type' => Constants::MQ_ROUTING_MESSAGE_CREATED,
             'organization' => $context->organization,
@@ -45,6 +58,7 @@ final class OutboxService
             'origin_client_id' => $context->clientId,
             'recipient_count' => count($recipientUserIds),
             'recipient_user_ids' => array_values(array_map('strval', $recipientUserIds)),
+            'recipient_homes' => $homes,
             'message' => $message,
             'created_at' => (string) $message['create_time'],
         ];

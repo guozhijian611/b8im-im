@@ -43,14 +43,17 @@ final class MessageService
 
     private array $messageConfigCache = [];
     private MessageShardRouter $messageShardRouter;
+    private CrossOrganizationSocialPolicy $crossOrgSocial;
 
     public function __construct(
         private readonly ImRepository $repository,
         private readonly Config $config,
         private readonly OutboxService $outbox,
         private readonly TenantImPolicyService $tenantImPolicies,
+        ?CrossOrganizationSocialPolicy $crossOrgSocial = null,
     ) {
         $this->messageShardRouter = new MessageShardRouter($repository, $config->messageShardBuckets);
+        $this->crossOrgSocial = $crossOrgSocial ?? new CrossOrganizationSocialPolicy($repository);
     }
 
     public function preflight(): void
@@ -167,10 +170,31 @@ final class MessageService
                         );
                         $messageRow['global_seq'] = (string) $globalSeq;
 
+                        $recipientHomes = is_array($conversation['recipient_homes'] ?? null)
+                            ? $conversation['recipient_homes']
+                            : [];
+                        if (!empty($conversation['is_cross_organization'])) {
+                            $this->mirrorCrossOrgMessage(
+                                senderOrganization: $context->organization,
+                                peerOrganization: (int) $conversation['peer_organization'],
+                                conversationId: (string) $conversation['conversation_id'],
+                                conversationType: $conversationType,
+                                messageId: $messageId,
+                                messageSeq: $messageSeq,
+                                clientMsgId: $clientMsgId,
+                                senderId: $context->userId,
+                                messageType: $messageType,
+                                contentJson: $contentJson,
+                                summary: $summary,
+                                now: $now,
+                                recipientUserIds: $recipientUserIds,
+                            );
+                        }
                         $this->outbox->createMessageCreated(
                             $context,
                             $this->formatMessage($messageRow),
                             $recipientUserIds,
+                            $recipientHomes,
                         );
 
                         return [
@@ -670,7 +694,10 @@ final class MessageService
             if ($toUserId === '' || $toUserId === $context->userId) {
                 throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
             }
-            $data['conversation_id'] = self::singleConversationId($context->organization, $context->userId, $toUserId);
+            $peer = $this->resolveSinglePeer($context->organization, $context->userId, $toUserId);
+            $data['conversation_id'] = $peer['conversation_id'];
+            $data['_peer_organization'] = $peer['peer_organization'];
+            $data['_is_cross_organization'] = $peer['is_cross_organization'];
 
             return $data;
         }
@@ -951,35 +978,57 @@ final class MessageService
         if ($toUserId === '' || $toUserId === $context->userId) {
             throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
         }
-        $this->assertActiveOrganizationUsers($context->organization, [$toUserId], 'SEND_SINGLE_RECEIVER_INVALID');
-        $this->assertSingleRelationship($context->organization, $context->userId, $toUserId);
+        $peer = $this->resolveSinglePeer($context->organization, $context->userId, $toUserId);
+        $peerOrganization = (int) $peer['peer_organization'];
+        $conversationId = (string) $peer['conversation_id'];
+        $isCross = (bool) $peer['is_cross_organization'];
+        $this->assertSingleRelationship(
+            $context->organization,
+            $context->userId,
+            $toUserId,
+            $peerOrganization,
+        );
 
-        $conversationId = self::singleConversationId($context->organization, $context->userId, $toUserId);
         $now = $this->now();
-        $this->repository->execute(
-            'INSERT INTO im_conversation
-                (organization, conversation_id, conversation_type, title, owner_user_id, status, create_time, update_time)
-             VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-             ON DUPLICATE KEY UPDATE update_time = VALUES(update_time)',
-            [$context->organization, $conversationId, self::CONVERSATION_SINGLE, '', $context->userId, $now, $now],
-        );
-        $conversation = $this->repository->fetchOne(
-            'SELECT conversation_type, status FROM im_conversation
-              WHERE organization = ? AND conversation_id = ? AND delete_time IS NULL
-              LIMIT 1 FOR UPDATE',
-            [$context->organization, $conversationId],
-        );
-        if ($conversation === null
-            || (int) $conversation['conversation_type'] !== self::CONVERSATION_SINGLE
-            || (int) $conversation['status'] !== 1) {
-            throw new ImException('单聊会话不存在、已停用或类型无效', 'SEND_CONVERSATION_INACTIVE');
+        $homes = [$context->organization];
+        if ($isCross) {
+            $homes[] = $peerOrganization;
+            sort($homes);
         }
-        $this->ensureMember($context->organization, $conversationId, $context->userId, 'owner');
-        $this->ensureMember($context->organization, $conversationId, $toUserId, 'member');
+        foreach ($homes as $homeOrg) {
+            $this->repository->execute(
+                'INSERT INTO im_conversation
+                    (organization, conversation_id, conversation_type, title, owner_user_id, status, create_time, update_time)
+                 VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                 ON DUPLICATE KEY UPDATE update_time = VALUES(update_time)',
+                [$homeOrg, $conversationId, self::CONVERSATION_SINGLE, '', $context->userId, $now, $now],
+            );
+            $this->ensureOrganizationSequence($homeOrg);
+            $conversation = $this->repository->fetchOne(
+                'SELECT conversation_type, status FROM im_conversation
+                  WHERE organization = ? AND conversation_id = ? AND delete_time IS NULL
+                  LIMIT 1 FOR UPDATE',
+                [$homeOrg, $conversationId],
+            );
+            if ($conversation === null
+                || (int) $conversation['conversation_type'] !== self::CONVERSATION_SINGLE
+                || (int) $conversation['status'] !== 1) {
+                throw new ImException('单聊会话不存在、已停用或类型无效', 'SEND_CONVERSATION_INACTIVE');
+            }
+            // Each home org records both user_ids so active membership and fanout work.
+            $this->ensureMember($homeOrg, $conversationId, $context->userId, 'owner');
+            $this->ensureMember($homeOrg, $conversationId, $toUserId, 'member');
+        }
 
         return [
             'conversation_id' => $conversationId,
             'recipient_user_ids' => [$toUserId],
+            'recipient_homes' => [
+                $toUserId => $peerOrganization,
+                $context->userId => $context->organization,
+            ],
+            'peer_organization' => $peerOrganization,
+            'is_cross_organization' => $isCross,
         ];
     }
 
@@ -1574,36 +1623,115 @@ final class MessageService
         }
     }
 
-    private function assertSingleRelationship(int $organization, string $senderId, string $recipientId): void
-    {
+    private function assertSingleRelationship(
+        int $organization,
+        string $senderId,
+        string $recipientId,
+        int $peerOrganization,
+    ): void {
         $target = $this->repository->fetchOne(
             'SELECT is_system FROM im_user
               WHERE organization = ? AND user_id = ? AND status = 1 AND delete_time IS NULL LIMIT 1',
-            [$organization, $recipientId],
+            [$peerOrganization, $recipientId],
         );
         if ((int) ($target['is_system'] ?? 2) === 1) {
             return;
         }
 
-        $relations = $this->repository->fetchAll(
-            'SELECT user_id, friend_user_id, status
-               FROM im_friend_relation
+        $forward = $this->repository->fetchOne(
+            'SELECT status, friend_organization FROM im_friend_relation
               WHERE organization = ?
+                AND user_id = ?
+                AND friend_user_id = ?
                 AND delete_time IS NULL
-                AND ((user_id = ? AND friend_user_id = ?)
-                  OR (user_id = ? AND friend_user_id = ?))',
-            [$organization, $senderId, $recipientId, $recipientId, $senderId],
+              LIMIT 1',
+            [$organization, $senderId, $recipientId],
         );
-        $directions = [];
-        foreach ($relations as $relation) {
-            if ((int) $relation['status'] !== 1) {
-                throw new ImException('好友关系已被拉黑或停用', 'SEND_SINGLE_RELATION_BLOCKED');
-            }
-            $directions[(string) $relation['user_id'] . '>' . (string) $relation['friend_user_id']] = true;
-        }
-        if (!isset($directions[$senderId . '>' . $recipientId], $directions[$recipientId . '>' . $senderId])) {
+        $reverse = $this->repository->fetchOne(
+            'SELECT status FROM im_friend_relation
+              WHERE organization = ?
+                AND user_id = ?
+                AND friend_user_id = ?
+                AND delete_time IS NULL
+              LIMIT 1',
+            [$peerOrganization, $recipientId, $senderId],
+        );
+        if ($forward === null || $reverse === null) {
             throw new ImException('建立双向好友关系后才能发送单聊消息', 'SEND_SINGLE_FRIEND_REQUIRED');
         }
+        if ((int) $forward['status'] !== 1 || (int) $reverse['status'] !== 1) {
+            throw new ImException('好友关系已被拉黑或停用', 'SEND_SINGLE_RELATION_BLOCKED');
+        }
+    }
+
+    /**
+     * @return array{conversation_id: string, peer_organization: int, is_cross_organization: bool}
+     */
+    private function resolveSinglePeer(int $organization, string $senderId, string $toUserId): array
+    {
+        $sameOrg = $this->repository->fetchOne(
+            'SELECT user_id FROM im_user
+              WHERE organization = ? AND user_id = ? AND status = 1 AND delete_time IS NULL
+              LIMIT 1',
+            [$organization, $toUserId],
+        );
+        if ($sameOrg !== null) {
+            return [
+                'conversation_id' => self::singleConversationId($organization, $senderId, $toUserId),
+                'peer_organization' => $organization,
+                'is_cross_organization' => false,
+            ];
+        }
+
+        $friend = $this->repository->fetchOne(
+            'SELECT friend_organization FROM im_friend_relation
+              WHERE organization = ?
+                AND user_id = ?
+                AND friend_user_id = ?
+                AND status = 1
+                AND delete_time IS NULL
+              LIMIT 1',
+            [$organization, $senderId, $toUserId],
+        );
+        $peerOrganization = (int) ($friend['friend_organization'] ?? 0);
+        if ($peerOrganization <= 0) {
+            $any = $this->repository->fetchOne(
+                'SELECT organization FROM im_user
+                  WHERE user_id = ? AND status = 1 AND delete_time IS NULL
+                  LIMIT 1',
+                [$toUserId],
+            );
+            $peerOrganization = (int) ($any['organization'] ?? 0);
+        }
+        if ($peerOrganization <= 0) {
+            throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
+        }
+        if ($peerOrganization !== $organization) {
+            if (!$this->crossOrgSocial->isEnabled()) {
+                throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
+            }
+            $active = $this->repository->fetchOne(
+                'SELECT user_id FROM im_user
+                  WHERE organization = ? AND user_id = ? AND status = 1 AND delete_time IS NULL
+                  LIMIT 1',
+                [$peerOrganization, $toUserId],
+            );
+            if ($active === null) {
+                throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
+            }
+
+            return [
+                'conversation_id' => CrossOrganizationSocialPolicy::crossOrgSingleConversationId($senderId, $toUserId),
+                'peer_organization' => $peerOrganization,
+                'is_cross_organization' => true,
+            ];
+        }
+
+        return [
+            'conversation_id' => self::singleConversationId($organization, $senderId, $toUserId),
+            'peer_organization' => $organization,
+            'is_cross_organization' => false,
+        ];
     }
 
     private function assertConversationWithoutSystemMember(int $organization, string $conversationId): void
@@ -1650,15 +1778,16 @@ final class MessageService
         $rows = $this->repository->fetchAll(
             'SELECT cm.user_id
                FROM im_conversation_member cm
-               INNER JOIN im_user u
-                  ON u.organization = cm.organization
-                 AND u.user_id = cm.user_id
-                 AND u.status = 1
-                 AND u.delete_time IS NULL
               WHERE cm.organization = ?
                 AND cm.conversation_id = ?
                 AND cm.status = 1
-                AND cm.delete_time IS NULL',
+                AND cm.delete_time IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM im_user u
+                     WHERE u.user_id = cm.user_id
+                       AND u.status = 1
+                       AND u.delete_time IS NULL
+                )',
             [$organization, $conversationId],
         );
 
@@ -2183,6 +2312,95 @@ final class MessageService
         ];
 
         return $config;
+    }
+
+    /**
+     * Dual-home message for recipient org so SYNC/history works for the peer.
+     *
+     * @param list<string> $recipientUserIds
+     */
+    private function mirrorCrossOrgMessage(
+        int $senderOrganization,
+        int $peerOrganization,
+        string $conversationId,
+        int $conversationType,
+        string $messageId,
+        int $messageSeq,
+        string $clientMsgId,
+        string $senderId,
+        int $messageType,
+        string $contentJson,
+        string $summary,
+        string $now,
+        array $recipientUserIds,
+    ): void {
+        if ($peerOrganization <= 0 || $peerOrganization === $senderOrganization) {
+            return;
+        }
+        $this->ensureOrganizationSequence($peerOrganization);
+        // Align peer conversation sequence cursor.
+        $this->repository->execute(
+            'UPDATE im_conversation
+                SET next_message_seq = GREATEST(next_message_seq, ?),
+                    last_message_id = ?,
+                    last_message_seq = ?,
+                    last_message_time = ?,
+                    last_message_summary = ?,
+                    update_time = ?
+              WHERE organization = ? AND conversation_id = ?',
+            [$messageSeq + 1, $messageId, $messageSeq, $now, $summary, $now, $peerOrganization, $conversationId],
+        );
+        $messageTable = $this->messageShardRouter->writeTable($peerOrganization, $conversationId, $now);
+        $exists = $this->repository->fetchOne(
+            'SELECT message_id FROM ' . $this->messageShardRouter->quote($messageTable) . '
+              WHERE organization = ? AND message_id = ? LIMIT 1',
+            [$peerOrganization, $messageId],
+        );
+        if ($exists === null) {
+            $this->repository->execute(
+                'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
+                    (organization, conversation_id, conversation_type, message_id, message_seq, client_msg_id,
+                     sender_id, message_type, content, status, create_time, update_time)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [
+                    $peerOrganization,
+                    $conversationId,
+                    $conversationType,
+                    $messageId,
+                    $messageSeq,
+                    $clientMsgId,
+                    $senderId,
+                    $messageType,
+                    $contentJson,
+                    self::MESSAGE_NORMAL,
+                    $now,
+                    $now,
+                ],
+            );
+        }
+        $index = $this->repository->fetchOne(
+            'SELECT message_id FROM im_message_index
+              WHERE organization = ? AND message_id = ? LIMIT 1',
+            [$peerOrganization, $messageId],
+        );
+        if ($index === null) {
+            $globalSeq = $this->allocateGlobalSeq($peerOrganization);
+            $this->createMessageIndex(
+                organization: $peerOrganization,
+                conversationId: $conversationId,
+                messageId: $messageId,
+                messageSeq: $messageSeq,
+                globalSeq: $globalSeq,
+                senderId: $senderId,
+                clientMsgId: $clientMsgId,
+                messageTable: $messageTable,
+                now: $now,
+            );
+        }
+        foreach ($recipientUserIds as $userId) {
+            $this->upsertReceipt($peerOrganization, $conversationId, $messageId, $userId, self::RECEIPT_SENT, null, null);
+        }
+        $this->increaseUnread($peerOrganization, $conversationId, $recipientUserIds);
     }
 
     private static function singleConversationId(int $organization, string $left, string $right): string

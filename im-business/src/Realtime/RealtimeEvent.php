@@ -11,6 +11,7 @@ final class RealtimeEvent
 {
     /**
      * @param list<string> $recipientUserIds
+     * @param array<string, int> $recipientHomes user_id => home organization for gateway uid binding
      * @param array<string, mixed> $packetData
      */
     public function __construct(
@@ -28,6 +29,7 @@ final class RealtimeEvent
         public readonly array $recipientUserIds,
         public readonly string $packetCommand,
         public readonly array $packetData,
+        public readonly array $recipientHomes = [],
     ) {
     }
 

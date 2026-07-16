@@ -139,6 +139,23 @@ final class RealtimeEventProjector
             'message' => $message,
         ];
 
+        $recipientHomes = [];
+        $rawHomes = $payload['recipient_homes'] ?? [];
+        if (is_array($rawHomes)) {
+            foreach ($rawHomes as $homeUserId => $homeOrg) {
+                $homeUserId = trim((string) $homeUserId);
+                $homeOrg = (int) $homeOrg;
+                if ($homeUserId !== '' && $homeOrg > 0) {
+                    $recipientHomes[$homeUserId] = $homeOrg;
+                }
+            }
+        }
+        foreach ($recipientUserIds as $recipientUserId) {
+            if (!isset($recipientHomes[$recipientUserId])) {
+                $recipientHomes[$recipientUserId] = $organization;
+            }
+        }
+
         return new RealtimeEvent(
             eventType: $eventType,
             organization: $organization,
@@ -154,6 +171,7 @@ final class RealtimeEventProjector
             recipientUserIds: $recipientUserIds,
             packetCommand: Command::PUSH,
             packetData: $packetData,
+            recipientHomes: $recipientHomes,
         );
     }
 
