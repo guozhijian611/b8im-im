@@ -752,8 +752,19 @@ try {
           WHERE organization = 1 AND conversation_id = ? AND user_id = ? LIMIT 1',
         [$conversationId, $recipientId],
     );
-    if ($nonRegressedState !== $fullyReadState || (int) ($lateDelivered['status'] ?? 0) !== 3) {
+    if ($nonRegressedState !== $fullyReadState || ($lateDelivered['status'] ?? '') !== 'read') {
         throw new RuntimeException('old/lower ACK regressed the read cursor or receipt status');
+    }
+    try {
+        $messages->ack($context($recipientId), [
+            'message_id' => $first['message']['message_id'],
+            'status' => 2,
+        ]);
+        throw new RuntimeException('numeric ACK status was accepted');
+    } catch (ImException $exception) {
+        if ($exception->errorCode() !== 'ACK_STATUS_INVALID') {
+            throw $exception;
+        }
     }
 
     $globalSync = $messages->sync($context($recipientId), ['after_global_seq' => '0', 'limit' => 20]);

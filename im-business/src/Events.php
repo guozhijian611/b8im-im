@@ -306,7 +306,15 @@ class Events
     {
         $context = self::requireContext($clientId);
         $result = Runtime::messages()->ack($context, $packet->data);
-        Gateway::sendToClient($clientId, self::responsePacket(Command::ACK_ACK, $result, $context->organization)->encode());
+        Gateway::sendToClient(
+            $clientId,
+            self::responsePacket(
+                Command::ACK_ACK,
+                $result,
+                $context->organization,
+                $packet->clientMsgId,
+            )->encode(),
+        );
 
         if ((string) $result['sender_id'] !== $context->userId) {
             Gateway::sendToUid(
@@ -382,7 +390,12 @@ class Events
         $result = Runtime::conversationSync()->markRead($context, $clientId, $conversationId, $lastReadMessageId);
         Gateway::sendToClient(
             $clientId,
-            self::responsePacket(Command::CONVERSATION_READ_ACK, $result, $context->organization)->encode()
+            self::responsePacket(
+                Command::CONVERSATION_READ_ACK,
+                $result,
+                $context->organization,
+                $packet->clientMsgId,
+            )->encode()
         );
     }
 

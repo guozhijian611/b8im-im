@@ -270,7 +270,7 @@ final class MessageService
                 'global_seq' => (string) $message['global_seq'],
                 'sender_id' => $message['sender_id'],
                 'user_id' => $context->userId,
-                'status' => $effectiveReceiptStatus,
+                'status' => $this->receiptStatusName($effectiveReceiptStatus),
                 'last_read_message_id' => (string) ($readState['last_read_message_id'] ?? ''),
                 'last_read_seq' => (int) ($readState['last_read_seq'] ?? 0),
                 'unread_count' => (int) ($readState['unread_count'] ?? 0),
@@ -1743,18 +1743,23 @@ final class MessageService
 
     private function normalizeReceiptStatus(mixed $status): int
     {
-        if (is_string($status)) {
-            return match (strtolower($status)) {
-                'delivered' => self::RECEIPT_DELIVERED,
-                'read' => self::RECEIPT_READ,
-                default => throw new ImException('回执状态无效', 'ACK_STATUS_INVALID'),
-            };
+        if (!is_string($status)) {
+            throw new ImException('回执状态无效', 'ACK_STATUS_INVALID');
         }
 
-        return match ((int) $status) {
-            self::RECEIPT_DELIVERED => self::RECEIPT_DELIVERED,
-            self::RECEIPT_READ => self::RECEIPT_READ,
+        return match (strtolower($status)) {
+            'delivered' => self::RECEIPT_DELIVERED,
+            'read' => self::RECEIPT_READ,
             default => throw new ImException('回执状态无效', 'ACK_STATUS_INVALID'),
+        };
+    }
+
+    private function receiptStatusName(int $status): string
+    {
+        return match ($status) {
+            self::RECEIPT_READ => 'read',
+            self::RECEIPT_DELIVERED => 'delivered',
+            default => 'sent',
         };
     }
 

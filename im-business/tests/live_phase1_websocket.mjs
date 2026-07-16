@@ -443,7 +443,7 @@ try {
       'sender ACK'
     )
   ])
-  assert.equal(ackAcknowledgement.data.status, 2)
+  assert.equal(ackAcknowledgement.data.status, 'delivered')
   assert.equal(Number(senderAck.organization), ORGANIZATION)
 
   bob.send({
@@ -456,7 +456,7 @@ try {
       && packet.data?.message_id === message.message_id,
     'duplicate ACK_ACK'
   )
-  assert.equal(duplicateAck.data.status, 2)
+  assert.equal(duplicateAck.data.status, 'delivered')
 
   let assetResult = null
   const fileId = String(process.env.FILE_ID ?? '')
