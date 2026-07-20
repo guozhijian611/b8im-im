@@ -23,9 +23,16 @@ use GatewayWorker\Lib\Gateway;
  */
 final class TypingService
 {
+    private readonly CrossOrganizationConversationAccess $conversationAccess;
+
     public function __construct(
         private readonly ImRepository $repository,
+        ?CrossOrganizationConversationAccess $conversationAccess = null,
     ) {
+        $this->conversationAccess = $conversationAccess ?? new CrossOrganizationConversationAccess(
+            $repository,
+            new CrossOrganizationSocialPolicy($repository),
+        );
     }
 
     /**
@@ -41,36 +48,64 @@ final class TypingService
         if ($conversationId === '') {
             throw new ImException('缺少 conversation_id', 'TYPING_CONVERSATION_ID_EMPTY');
         }
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+        );
 
-        $memberUserIds = $this->conversationMembers($context->organization, $conversationId);
-        if (empty($memberUserIds)) {
-            return;
-        }
-        if (!in_array($context->userId, $memberUserIds, true)) {
-            throw new ImException('会话不存在或无权访问', 'TYPING_MEMBER_NOT_FOUND');
-        }
+        $this->repository->transaction(function () use (
+            $context,
+            $clientId,
+            $conversationId,
+            $accessPreview,
+        ): void {
+            // Keep the shared access boundary locked until every relay has been
+            // handed to Gateway, so a revoke cannot commit in the middle.
+            $this->conversationAccess->assertAccessible(
+                $context->organization,
+                $conversationId,
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
 
-        $payload = Packet::make(Command::TYPING, [
-            'conversation_id' => $conversationId,
-            'user_id' => $context->userId,
-            'username' => $context->username,
-        ], $context->organization)->encode();
-
-        // 推给会话中其他成员
-        foreach ($memberUserIds as $userId) {
-            if ($userId === $context->userId) {
-                continue;
+            $memberIdentities = $this->conversationMemberIdentities(
+                $context->organization,
+                $conversationId,
+            );
+            if (empty($memberIdentities)) {
+                return;
             }
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, $userId), $payload);
-        }
-
-        // 推给自己的其他设备（多端同步"对方在输入"的状态）
-        $clientIds = Gateway::getClientIdByUid($context->uid());
-        foreach ($clientIds as $cid) {
-            if ($cid !== $clientId) {
-                Gateway::sendToClient($cid, $payload);
+            $isMember = array_filter(
+                $memberIdentities,
+                static fn (array $identity): bool =>
+                    (int) $identity['organization'] === $context->organization
+                    && (string) $identity['user_id'] === $context->userId,
+            );
+            if ($isMember === []) {
+                throw new ImException('会话不存在或无权访问', 'TYPING_MEMBER_NOT_FOUND');
             }
-        }
+
+            foreach ($memberIdentities as $identity) {
+                $memberOrganization = (int) $identity['organization'];
+                $userId = (string) $identity['user_id'];
+                $payload = Packet::make(Command::TYPING, [
+                    'conversation_id' => $conversationId,
+                    'actor_organization' => $context->organization,
+                    'actor_user_id' => $context->userId,
+                    'username' => $context->username,
+                ], $memberOrganization)->encode();
+                if ($memberOrganization === $context->organization && $userId === $context->userId) {
+                    foreach (Gateway::getClientIdByUid($context->uid()) as $cid) {
+                        if ($cid !== $clientId) {
+                            Gateway::sendToClient($cid, $payload);
+                        }
+                    }
+                    continue;
+                }
+                Gateway::sendToUid(AuthContext::uidFor($memberOrganization, $userId), $payload);
+            }
+        });
     }
 
     /**
@@ -78,10 +113,10 @@ final class TypingService
      *
      * @return list<string>
      */
-    private function conversationMembers(int $organization, string $conversationId): array
+    private function conversationMemberIdentities(int $organization, string $conversationId): array
     {
         $rows = $this->repository->fetchAll(
-            'SELECT cm.user_id FROM im_conversation_member cm
+            'SELECT cm.member_organization, cm.user_id FROM im_conversation_member cm
               INNER JOIN im_conversation c
                  ON c.organization = cm.organization
                 AND c.conversation_id = cm.conversation_id
@@ -94,6 +129,12 @@ final class TypingService
             [$organization, $conversationId],
         );
 
-        return array_values(array_map(static fn (array $row): string => (string) $row['user_id'], $rows));
+        return array_values(array_map(
+            static fn (array $row): array => [
+                'organization' => (int) $row['member_organization'],
+                'user_id' => (string) $row['user_id'],
+            ],
+            $rows,
+        ));
     }
 }

@@ -1,0 +1,166 @@
+name: IM quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_NAME: nb8im_cross_org_ci
+      DB_USER: root
+      DB_PASSWORD: root
+      MYSQL_PWD: root
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      IM_EXPECT_DATABASE: nb8im_cross_org_ci
+      IM_MESSAGE_SHARD_BUCKETS: 64
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7.2.7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+    steps:
+      - name: Checkout b8im-im
+        uses: actions/checkout@v4
+        with:
+          path: b8im-im
+
+      - name: Resolve locked b8im-im-shared reference
+        id: shared_ref
+        working-directory: b8im-im
+        shell: bash
+        run: |
+          ref="$(
+            php <<'PHP'
+          <?php
+          $lock = json_decode(
+              file_get_contents('im-business/composer.lock'),
+              true,
+              flags: JSON_THROW_ON_ERROR,
+          );
+          foreach ($lock['packages'] ?? [] as $package) {
+              if (($package['name'] ?? '') !== 'b8im/im-shared') {
+                  continue;
+              }
+              $reference = (string) ($package['dist']['reference'] ?? '');
+              if (preg_match('/^[0-9a-f]{40}$/D', $reference) !== 1) {
+                  fwrite(STDERR, "b8im/im-shared lock reference is not a full commit SHA\n");
+                  exit(1);
+              }
+              fwrite(STDOUT, $reference);
+              exit(0);
+          }
+          fwrite(STDERR, "b8im/im-shared is missing from im-business/composer.lock\n");
+          exit(1);
+          PHP
+          )"
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout b8im-im-shared
+        uses: actions/checkout@v4
+        with:
+          repository: guozhijian611/b8im-im-shared
+          ref: ${{ steps.shared_ref.outputs.ref }}
+          path: b8im-im-shared
+
+      - name: Verify locked b8im-im-shared checkout
+        shell: bash
+        run: |
+          actual="$(git -C b8im-im-shared rev-parse HEAD)"
+          expected="${{ steps.shared_ref.outputs.ref }}"
+          test "${actual}" = "${expected}"
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, pdo_mysql, redis
+          coverage: none
+
+      - name: Install shared dependencies
+        working-directory: b8im-im-shared
+        run: |
+          composer validate
+          composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Test shared contract
+        working-directory: b8im-im-shared
+        run: composer lint && composer test
+
+      - name: Install IM process dependencies
+        run: |
+          for service in im-register im-gateway im-business; do
+            composer validate --working-dir="b8im-im/${service}"
+            composer install --working-dir="b8im-im/${service}" --no-interaction --no-progress --prefer-dist
+          done
+
+      - name: Verify Redis service
+        shell: bash
+        run: |
+          php -r '
+          $redis = new Redis();
+          $connected = $redis->connect(
+              (string) getenv("REDIS_HOST"),
+              (int) getenv("REDIS_PORT"),
+              2.0,
+          );
+          $pong = $connected ? $redis->ping() : false;
+          if (!in_array($pong, [true, "PONG", "+PONG"], true)) {
+              fwrite(STDERR, "Redis service ping failed\n");
+              exit(1);
+          }
+          fwrite(STDOUT, "Redis service PONG\n");
+          '
+
+      - name: Migrate isolated cross-organization database
+        shell: bash
+        run: |
+          mysql --protocol=tcp -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" \
+            -e "CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"
+          mysql --protocol=tcp -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" "${DB_NAME}" \
+            < b8im-im/im-business/tests/fixtures/cross_org_control_plane.sql
+          composer --working-dir=b8im-im/im-business migrate
+
+      - name: Test gateway and business
+        shell: bash
+        run: |
+          composer --working-dir=b8im-im/im-gateway lint
+          composer --working-dir=b8im-im/im-gateway test
+          composer --working-dir=b8im-im/im-business lint
+          set -o pipefail
+          composer --working-dir=b8im-im/im-business test | tee /tmp/im-business-test.log
+          if grep -Fq 'SKIP cross-org MessageService integration' /tmp/im-business-test.log; then
+            echo 'cross-org MessageService integration was skipped' >&2
+            exit 1
+          fi
+          grep -Fq '[PASS] same device connections coexist with exact session binding and cleanup' /tmp/im-business-test.log
+          grep -Fq '163 passed, 0 failed' /tmp/im-business-test.log
+          grep -Fq 'migration up succeeds again after destructive down' /tmp/im-business-test.log
+
+      - name: Syntax-check register
+        run: find b8im-im/im-register/src -name '*.php' -print0 | xargs -0 -n1 php -l

@@ -44,6 +44,7 @@ final class MessageService
     private array $messageConfigCache = [];
     private MessageShardRouter $messageShardRouter;
     private CrossOrganizationSocialPolicy $crossOrgSocial;
+    private CrossOrganizationConversationAccess $conversationAccess;
 
     public function __construct(
         private readonly ImRepository $repository,
@@ -51,9 +52,12 @@ final class MessageService
         private readonly OutboxService $outbox,
         private readonly TenantImPolicyService $tenantImPolicies,
         ?CrossOrganizationSocialPolicy $crossOrgSocial = null,
+        ?CrossOrganizationConversationAccess $conversationAccess = null,
     ) {
         $this->messageShardRouter = new MessageShardRouter($repository, $config->messageShardBuckets);
         $this->crossOrgSocial = $crossOrgSocial ?? new CrossOrganizationSocialPolicy($repository);
+        $this->conversationAccess = $conversationAccess
+            ?? new CrossOrganizationConversationAccess($repository, $this->crossOrgSocial);
     }
 
     public function preflight(): void
@@ -64,9 +68,18 @@ final class MessageService
     public function send(AuthContext $context, Packet $packet): array
     {
         $data = $packet->data;
-        $clientMsgId = trim((string) ($packet->clientMsgId ?? $data['client_msg_id'] ?? ''));
-        if ($clientMsgId === '') {
-            throw new ImException('缺少 client_msg_id', 'SEND_CLIENT_MSG_ID_EMPTY');
+        $clientMsgId = $packet->clientMsgId;
+        if (
+            $clientMsgId === null
+            || $clientMsgId === ''
+            || trim($clientMsgId) !== $clientMsgId
+            || strlen($clientMsgId) > 80
+            || str_contains($clientMsgId, "\0")
+        ) {
+            throw new ImException(
+                '缺少或无效的顶层 client_msg_id',
+                'SEND_CLIENT_MSG_ID_INVALID',
+            );
         }
 
         $messageType = (int) ($data['message_type'] ?? 0);
@@ -77,129 +90,192 @@ final class MessageService
         $content = $this->normalizeContent($context, $messageType, $data['content'] ?? []);
         $conversationType = $this->normalizeConversationType($data);
 
+        $data = $this->ensureWriteConversationId($context, $conversationType, $data);
         $this->messageShardRouter->assertIndexTableReady();
-        $duplicated = $this->findMessageByClientMsg($context->organization, $context->userId, $clientMsgId);
-        if ($duplicated !== null) {
-            return [
-                'duplicated' => true,
-                'message' => $this->formatMessage($duplicated),
-                'recipient_user_ids' => [],
-            ];
+        if ((int) ($data['_peer_organization'] ?? $context->organization) === $context->organization) {
+            $duplicated = $this->findMessageByClientMsg(
+                $context->organization,
+                $context->organization,
+                $context->userId,
+                $clientMsgId,
+            );
+            if ($duplicated !== null) {
+                return [
+                    'duplicated' => true,
+                    'message' => $this->formatMessage($duplicated),
+                    'recipient_user_ids' => [],
+                ];
+            }
         }
 
         $now = $this->now();
-        $data = $this->ensureWriteConversationId($context, $conversationType, $data);
-        $this->ensureOrganizationSequence($context->organization);
-        $messageTable = $this->messageShardRouter->writeTable($context->organization, (string) $data['conversation_id'], $now);
+        $homeOrganizations = [$context->organization];
+        $peerOrganization = (int) ($data['_peer_organization'] ?? $context->organization);
+        if ($conversationType === self::CONVERSATION_SINGLE && $peerOrganization !== $context->organization) {
+            $homeOrganizations[] = $peerOrganization;
+        }
+        $homeOrganizations = array_values(array_unique($homeOrganizations));
+        sort($homeOrganizations, SORT_NUMERIC);
+        $messageTables = [];
+        foreach ($homeOrganizations as $homeOrganization) {
+            $messageTables[$homeOrganization] = $this->messageShardRouter->writeTable(
+                $homeOrganization,
+                (string) $data['conversation_id'],
+                $now,
+            );
+        }
         try {
             return Telemetry::run(
                 'im.message.persist',
-                function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTable, $now): array {
-                    return $this->repository->transaction(function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTable, $now): array {
+                function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTables, $now): array {
+                    return $this->repository->transaction(function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTables, $now): array {
                         $conversation = $conversationType === self::CONVERSATION_SINGLE
                             ? $this->ensureSingleConversation($context, $data)
                             : $this->ensureGroupConversation($context, $data);
 
-                        $messageSeq = $this->allocateMessageSeq($context->organization, $conversation['conversation_id']);
+                        $homeOrganizations = $conversation['home_organizations'];
+                        foreach ($homeOrganizations as $homeOrganization) {
+                            $this->ensureOrganizationSequence($homeOrganization);
+                        }
+                        $messageSeq = $this->allocateMessageSeq(
+                            (string) $conversation['conversation_id'],
+                            $homeOrganizations,
+                        );
                         $messageId = $this->newMessageId();
                         $contentJson = json_encode($content, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
                         $summary = $this->summary($messageType, $content);
-
-                        Telemetry::run(
-                            'im.message.body.insert',
-                            fn () => $this->repository->execute(
-                                'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
-                        (organization, conversation_id, conversation_type, message_id, message_seq, client_msg_id, sender_id, message_type, content, status, create_time, update_time)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        $homeMessages = [];
+                        foreach ($homeOrganizations as $homeOrganization) {
+                            $messageTable = $messageTables[$homeOrganization]
+                                ?? throw new ImException('消息分片未预建', 'IM_MESSAGE_SHARD_NOT_READY');
+                            Telemetry::run(
+                                'im.message.body.insert',
+                                fn () => $this->repository->execute(
+                                    'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
+                            (organization, conversation_id, conversation_type, message_id, message_seq, client_msg_id,
+                             sender_id, sender_organization, message_type, content, status, create_time, update_time)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                    [
+                                        $homeOrganization,
+                                        $conversation['conversation_id'],
+                                        $conversationType,
+                                        $messageId,
+                                        $messageSeq,
+                                        $clientMsgId,
+                                        $context->userId,
+                                        $context->organization,
+                                        $messageType,
+                                        $contentJson,
+                                        self::MESSAGE_NORMAL,
+                                        $now,
+                                        $now,
+                                    ],
+                                ),
+                                SpanKind::KIND_CLIENT,
                                 [
+                                    'operation' => 'im.message.body.insert',
+                                    'db.system.name' => 'mysql',
+                                    'db.operation.name' => 'INSERT',
+                                    'db.collection.name' => $messageTable,
+                                    'b8im.organization' => $homeOrganization,
+                                    'b8im.message_id' => $messageId,
+                                ],
+                            );
+
+                            $messageRow = $this->repository->fetchOne(
+                                'SELECT * FROM ' . $this->messageShardRouter->quote($messageTable)
+                                . ' WHERE organization = ? AND message_id = ? LIMIT 1',
+                                [$homeOrganization, $messageId],
+                            );
+                            if ($messageRow === null) {
+                                throw new ImException('消息写入失败', 'SEND_MESSAGE_CREATE_FAILED');
+                            }
+                            $messageRow['_message_table'] = $messageTable;
+
+                            $homeIdentities = $this->homeRecipientIdentities(
+                                $homeOrganization,
+                                $conversationType,
+                                $conversation['participant_identities'],
+                            );
+                            $this->createHomeReceipts(
+                                $homeOrganization,
+                                (string) $conversation['conversation_id'],
+                                $messageId,
+                                $homeIdentities,
+                                $context->organization,
+                                $context->userId,
+                            );
+                            $unreadIdentities = array_values(array_filter(
+                                $homeIdentities,
+                                fn (array $identity): bool => !$this->sameIdentity(
+                                    $identity,
                                     $context->organization,
-                                    $conversation['conversation_id'],
-                                    $conversationType,
+                                    $context->userId,
+                                ),
+                            ));
+                            $this->increaseUnread(
+                                $homeOrganization,
+                                (string) $conversation['conversation_id'],
+                                $unreadIdentities,
+                            );
+                            $this->repository->execute(
+                                'UPDATE im_conversation
+                                    SET last_message_id = ?, last_message_seq = ?, last_message_time = ?,
+                                        last_message_summary = ?, update_time = ?
+                                  WHERE organization = ? AND conversation_id = ?',
+                                [
                                     $messageId,
                                     $messageSeq,
-                                    $clientMsgId,
-                                    $context->userId,
-                                    $messageType,
-                                    $contentJson,
-                                    self::MESSAGE_NORMAL,
                                     $now,
+                                    $summary,
                                     $now,
+                                    $homeOrganization,
+                                    $conversation['conversation_id'],
                                 ],
-                            ),
-                            SpanKind::KIND_CLIENT,
-                            [
-                                'operation' => 'im.message.body.insert',
-                                'db.system.name' => 'mysql',
-                                'db.operation.name' => 'INSERT',
-                                'db.collection.name' => $messageTable,
-                                'b8im.organization' => $context->organization,
-                                'b8im.message_id' => $messageId,
-                            ],
-                        );
+                            );
 
-                        $messageRow = $this->repository->fetchOne(
-                            'SELECT * FROM ' . $this->messageShardRouter->quote($messageTable) . ' WHERE organization = ? AND message_id = ? LIMIT 1',
-                            [$context->organization, $messageId],
-                        );
-                        if ($messageRow === null) {
-                            throw new ImException('消息写入失败', 'SEND_MESSAGE_CREATE_FAILED');
-                        }
-                        $messageRow['_message_table'] = $messageTable;
-
-                        $recipientUserIds = $conversation['recipient_user_ids'];
-                        $this->createReceipts($context, $conversation['conversation_id'], $messageId, $recipientUserIds);
-                        $this->increaseUnread($context->organization, $conversation['conversation_id'], $recipientUserIds);
-                        $this->repository->execute(
-                            'UPDATE im_conversation
-                        SET last_message_id = ?, last_message_seq = ?, last_message_time = ?, last_message_summary = ?, update_time = ?
-                      WHERE organization = ? AND conversation_id = ?',
-                            [$messageId, $messageSeq, $now, $summary, $now, $context->organization, $conversation['conversation_id']],
-                        );
-
-                        $globalSeq = $this->allocateGlobalSeq($context->organization);
-                        $this->createMessageIndex(
-                            organization: $context->organization,
-                            conversationId: $conversation['conversation_id'],
-                            messageId: $messageId,
-                            messageSeq: $messageSeq,
-                            globalSeq: $globalSeq,
-                            senderId: $context->userId,
-                            clientMsgId: $clientMsgId,
-                            messageTable: $messageTable,
-                            now: $now,
-                        );
-                        $messageRow['global_seq'] = (string) $globalSeq;
-
-                        $recipientHomes = is_array($conversation['recipient_homes'] ?? null)
-                            ? $conversation['recipient_homes']
-                            : [];
-                        if (!empty($conversation['is_cross_organization'])) {
-                            $this->mirrorCrossOrgMessage(
-                                senderOrganization: $context->organization,
-                                peerOrganization: (int) $conversation['peer_organization'],
+                            $globalSeq = $this->allocateGlobalSeq($homeOrganization);
+                            $this->createMessageIndex(
+                                organization: $homeOrganization,
                                 conversationId: (string) $conversation['conversation_id'],
-                                conversationType: $conversationType,
                                 messageId: $messageId,
                                 messageSeq: $messageSeq,
-                                clientMsgId: $clientMsgId,
+                                globalSeq: $globalSeq,
+                                senderOrganization: $context->organization,
                                 senderId: $context->userId,
-                                messageType: $messageType,
-                                contentJson: $contentJson,
-                                summary: $summary,
+                                clientMsgId: $clientMsgId,
+                                messageTable: $messageTable,
                                 now: $now,
-                                recipientUserIds: $recipientUserIds,
+                            );
+                            $messageRow['global_seq'] = (string) $globalSeq;
+                            $formatted = $this->formatMessage($messageRow);
+                            $homeMessages[$homeOrganization] = $formatted;
+                            $this->outbox->createMessageCreated(
+                                context: $context,
+                                homeOrganization: $homeOrganization,
+                                message: $formatted,
+                                recipientIdentities: $homeIdentities,
+                                crossOrgAccessSnapshotId: $conversation['cross_org_access_snapshot_id'],
                             );
                         }
-                        $this->outbox->createMessageCreated(
-                            $context,
-                            $this->formatMessage($messageRow),
-                            $recipientUserIds,
-                            $recipientHomes,
-                        );
+
+                        $originMessage = $homeMessages[$context->organization]
+                            ?? throw new ImException('发送方消息投影缺失', 'SEND_HOME_PROJECTION_MISSING');
+                        $recipientUserIds = array_values(array_map(
+                            static fn (array $identity): string => (string) $identity['user_id'],
+                            array_filter(
+                                $conversation['participant_identities'],
+                                fn (array $identity): bool => !$this->sameIdentity(
+                                    $identity,
+                                    $context->organization,
+                                    $context->userId,
+                                ),
+                            ),
+                        ));
 
                         return [
                             'duplicated' => false,
-                            'message' => $this->formatMessage($messageRow),
+                            'message' => $originMessage,
                             'recipient_user_ids' => $recipientUserIds,
                         ];
                     });
@@ -213,7 +289,12 @@ final class MessageService
             );
         } catch (PDOException $exception) {
             if ($this->isClientMessageIdempotencyConflict($exception)) {
-                $message = $this->findMessageByClientMsg($context->organization, $context->userId, $clientMsgId);
+                $message = $this->findMessageByClientMsg(
+                    $context->organization,
+                    $context->organization,
+                    $context->userId,
+                    $clientMsgId,
+                );
                 if ($message !== null) {
                     return [
                         'duplicated' => true,
@@ -229,6 +310,7 @@ final class MessageService
 
     public function ack(AuthContext $context, array $data): array
     {
+        $clientMsgId = $this->requireOperationClientMsgId($data, 'ACK');
         $messageId = trim((string) ($data['message_id'] ?? ''));
         if ($messageId === '') {
             throw new ImException('缺少 message_id', 'ACK_MESSAGE_ID_EMPTY');
@@ -237,6 +319,10 @@ final class MessageService
         $receiptStatus = $this->normalizeReceiptStatus($data['status'] ?? self::RECEIPT_DELIVERED);
         $this->messageShardRouter->assertIndexTableReady();
         $message = $this->findVisibleMessage($context, $messageId);
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            (string) $message['conversation_id'],
+        );
         $now = $this->now();
 
         return $this->repository->transaction(function () use (
@@ -245,66 +331,114 @@ final class MessageService
             $messageId,
             $receiptStatus,
             $now,
+            $clientMsgId,
+            $accessPreview,
         ): array {
+            $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
             $deliveredTime = $receiptStatus >= self::RECEIPT_DELIVERED ? $now : null;
             $readTime = $receiptStatus >= self::RECEIPT_READ ? $now : null;
-            $this->repository->execute(
-                'INSERT INTO im_message_receipt
-                    (organization, conversation_id, message_id, user_id, status, delivered_time, read_time, create_time, update_time)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE
-                    delivered_time = COALESCE(delivered_time, VALUES(delivered_time)),
-                    read_time = COALESCE(read_time, VALUES(read_time)),
-                    update_time = VALUES(update_time)',
-                [
-                    $context->organization,
-                    $message['conversation_id'],
+            $access = $this->conversationAccess->assertAccessible(
+                $context->organization,
+                (string) $message['conversation_id'],
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
+            $homeOrganizations = $access['home_organizations'];
+            $homeMessages = $this->messageHomeProjections($message, $homeOrganizations);
+            $message = $homeMessages[$context->organization]
+                ?? throw new ImException('当前home消息投影缺失', 'MESSAGE_HOME_PROJECTION_MISSING');
+            foreach ($homeOrganizations as $homeOrganization) {
+                $this->upsertReceipt(
+                    $homeOrganization,
+                    (string) $message['conversation_id'],
                     $messageId,
+                    $context->organization,
                     $context->userId,
                     $receiptStatus,
                     $deliveredTime,
                     $readTime,
-                    $now,
-                    $now,
-                ],
-            );
+                );
+            }
             $highestReceipt = $this->repository->fetchOne(
                 'SELECT MAX(status) AS status FROM im_message_receipt
-                  WHERE organization = ? AND message_id = ? AND user_id = ?',
-                [$context->organization, $messageId, $context->userId],
+                  WHERE organization = ? AND message_id = ?
+                    AND user_organization = ? AND user_id = ?',
+                [
+                    $context->organization,
+                    $messageId,
+                    $context->organization,
+                    $context->userId,
+                ],
             );
             $effectiveReceiptStatus = max($receiptStatus, (int) ($highestReceipt['status'] ?? 0));
 
             $readState = null;
             if ($effectiveReceiptStatus >= self::RECEIPT_READ) {
-                $readState = $this->advanceReadState(
-                    $context,
-                    (string) $message['conversation_id'],
-                    $messageId,
-                    (int) $message['message_seq'],
-                    $now,
-                );
+                foreach ($homeOrganizations as $homeOrganization) {
+                    $homeReadState = $this->advanceReadState(
+                        $homeOrganization,
+                        $context->organization,
+                        $context->userId,
+                        (string) $message['conversation_id'],
+                        $messageId,
+                        (int) $message['message_seq'],
+                        $now,
+                    );
+                    if ($homeOrganization === $context->organization) {
+                        $readState = $homeReadState;
+                    }
+                }
             }
 
-            return [
+            $result = [
                 'organization' => $context->organization,
                 'message_id' => $messageId,
                 'conversation_id' => $message['conversation_id'],
                 'message_seq' => (int) $message['message_seq'],
                 'global_seq' => (string) $message['global_seq'],
+                'sender_organization' => (int) $message['sender_organization'],
                 'sender_id' => $message['sender_id'],
+                'user_organization' => $context->organization,
                 'user_id' => $context->userId,
                 'status' => $this->receiptStatusName($effectiveReceiptStatus),
                 'last_read_message_id' => (string) ($readState['last_read_message_id'] ?? ''),
                 'last_read_seq' => (int) ($readState['last_read_seq'] ?? 0),
                 'unread_count' => (int) ($readState['unread_count'] ?? 0),
                 'time' => $now,
+                ...$this->requestBinding($context, $clientMsgId),
             ];
+            foreach ($homeOrganizations as $homeOrganization) {
+                $homeReceipt = $result;
+                $homeReceipt['organization'] = $homeOrganization;
+                $homeReceipt['global_seq'] = (string) $homeMessages[$homeOrganization]['global_seq'];
+                $recipientIdentities = $this->homeRecipientIdentities(
+                    $homeOrganization,
+                    (int) $message['conversation_type'],
+                    $this->conversationMemberIdentities(
+                        $homeOrganization,
+                        (string) $message['conversation_id'],
+                    ),
+                );
+                $this->outbox->createMessageReceipt(
+                    context: $context,
+                    homeOrganization: $homeOrganization,
+                    receipt: $homeReceipt,
+                    conversationType: (int) $message['conversation_type'],
+                    recipientIdentities: $recipientIdentities,
+                    crossOrgAccessSnapshotId: $access['is_cross_organization']
+                        ? $access['access_snapshot_id']
+                        : null,
+                );
+            }
+
+            return $result;
         });
     }
 
     public function recall(AuthContext $context, array $data): array
     {
+        $clientMsgId = $this->requireOperationClientMsgId($data, 'RECALL');
         $messageId = trim((string) ($data['message_id'] ?? ''));
         if ($messageId === '') {
             throw new ImException('缺少 message_id', 'RECALL_MESSAGE_ID_EMPTY');
@@ -312,10 +446,40 @@ final class MessageService
 
         $this->messageShardRouter->assertIndexTableReady();
         $previewMessage = $this->findVisibleMessage($context, $messageId);
-        $this->messageShardRouter->writeTable($context->organization, (string) $previewMessage['conversation_id'], $this->now());
-        return $this->repository->transaction(function () use ($context, $messageId): array {
-            $message = $this->findVisibleMessage($context, $messageId, true);
-            if ((string) $message['sender_id'] !== $context->userId) {
+        $conversationId = (string) $previewMessage['conversation_id'];
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+        );
+        $this->messageShardRouter->writeTable($context->organization, $conversationId, $this->now());
+        return $this->repository->transaction(function () use (
+            $context,
+            $messageId,
+            $clientMsgId,
+            $conversationId,
+            $accessPreview,
+        ): array {
+            $homePolicies = $this->lockCrossHomeTenantPolicyBoundary(
+                $accessPreview['home_organizations'],
+            );
+            $access = $this->conversationAccess->assertAccessible(
+                $context->organization,
+                $conversationId,
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
+            $preview = $this->findVisibleMessage($context, $messageId);
+            $homeMessages = $this->messageHomeProjections(
+                $preview,
+                $access['home_organizations'],
+            );
+            $message = $homeMessages[$context->organization]
+                ?? throw new ImException('当前home消息投影缺失', 'MESSAGE_HOME_PROJECTION_MISSING');
+            if (
+                (int) $message['sender_organization'] !== $context->organization
+                || (string) $message['sender_id'] !== $context->userId
+            ) {
                 throw new ImException('只能撤回自己发送的消息', 'RECALL_FORBIDDEN');
             }
             if ((int) $message['status'] === self::MESSAGE_RECALLED) {
@@ -331,58 +495,101 @@ final class MessageService
                         self::CHANGE_RECALL,
                         null,
                     ),
+                    ...$this->requestBinding($context, $clientMsgId),
                 ];
             }
-            $recallWindowSeconds = $this->tenantImPolicies
-                ->policy($context->organization)
-                ->messageRecallWindowSeconds;
-            if ($recallWindowSeconds > 0 && strtotime((string) $message['create_time']) + $recallWindowSeconds < time()) {
-                throw new ImException('消息已超过可撤回时间', 'RECALL_EXPIRED');
+            $recallPolicies = $homePolicies !== []
+                ? $homePolicies
+                : [$context->organization => $this->tenantImPolicies->policy($context->organization)];
+            foreach ($recallPolicies as $policy) {
+                $recallWindowSeconds = $policy->messageRecallWindowSeconds;
+                if (
+                    $recallWindowSeconds > 0
+                    && strtotime((string) $message['create_time']) + $recallWindowSeconds < time()
+                ) {
+                    throw new ImException('消息已超过任一参与机构允许的撤回时间', 'RECALL_EXPIRED');
+                }
             }
 
             $now = $this->now();
-            $affected = $this->repository->execute(
-                'UPDATE ' . $this->messageShardRouter->quote($this->messageTableOf($message)) . '
-                    SET status = ?, update_time = ?
-                  WHERE organization = ? AND message_id = ? AND status = ? AND delete_time IS NULL',
-                [self::MESSAGE_RECALLED, $now, $context->organization, $messageId, self::MESSAGE_NORMAL],
-            );
-            if ($affected !== 1) {
-                throw new ImException('消息状态已被并发修改', 'RECALL_CONFLICT');
+            foreach ($homeMessages as $homeOrganization => &$homeMessage) {
+                $affected = $this->repository->execute(
+                    'UPDATE ' . $this->messageShardRouter->quote($this->messageTableOf($homeMessage)) . '
+                        SET status = ?, update_time = ?
+                      WHERE organization = ? AND message_id = ? AND status = ? AND delete_time IS NULL',
+                    [
+                        self::MESSAGE_RECALLED,
+                        $now,
+                        $homeOrganization,
+                        $messageId,
+                        self::MESSAGE_NORMAL,
+                    ],
+                );
+                if ($affected !== 1) {
+                    throw new ImException('消息状态已被并发修改', 'RECALL_CONFLICT');
+                }
+                $homeMessage['status'] = self::MESSAGE_RECALLED;
+                $homeMessage['update_time'] = $now;
             }
-            $changeSeq = $this->recordMessageChange(
+            unset($homeMessage);
+            $changeSeqs = $this->recordMessageChanges(
                 context: $context,
-                message: $message,
+                homeMessages: $homeMessages,
                 changeType: self::CHANGE_RECALL,
+                targetOrganization: null,
                 targetUserId: null,
                 payload: ['status' => 'recalled'],
                 eventType: Constants::MQ_ROUTING_MESSAGE_RECALLED,
                 now: $now,
+                crossOrgAccessSnapshotId: $access['is_cross_organization']
+                    ? $access['access_snapshot_id']
+                    : null,
             );
             $noticeState = [];
-            if ($this->messageNoticeEnabled($context->organization, self::NOTICE_RECALL, (int) $message['conversation_type'])) {
+            $recallNoticeRequired = $homePolicies !== []
+                ? $this->recallNoticeRequiredByAnyHome(
+                    $homePolicies,
+                    (int) $message['conversation_type'],
+                )
+                : $this->messageNoticeEnabled(
+                    $context->organization,
+                    self::NOTICE_RECALL,
+                    (int) $message['conversation_type'],
+                );
+            if ($recallNoticeRequired) {
                 $noticeState = $this->createSystemNotice(
                     $context,
                     (string) $message['conversation_id'],
                     (int) $message['conversation_type'],
+                    $access['home_organizations'],
+                    $access['is_cross_organization'] ? $access['access_snapshot_id'] : null,
                     self::NOTICE_RECALL,
                     ['target_message_id' => $messageId],
                 );
             }
-            $conversationState = $noticeState ?: $this->refreshConversationLastMessage(
-                $context->organization,
-                (string) $message['conversation_id'],
-                $now,
-            );
+            $conversationState = $noticeState;
+            if ($conversationState === []) {
+                foreach (array_keys($homeMessages) as $homeOrganization) {
+                    $state = $this->refreshConversationLastMessage(
+                        (int) $homeOrganization,
+                        (string) $message['conversation_id'],
+                        $now,
+                    );
+                    if ((int) $homeOrganization === $context->organization) {
+                        $conversationState = $state;
+                    }
+                }
+            }
 
             return [
                 'message_id' => $messageId,
                 'conversation_id' => $message['conversation_id'],
                 'recipient_user_ids' => $this->conversationMembers($context->organization, $message['conversation_id']),
                 'recalled' => true,
-                'change_seq' => $changeSeq,
+                'change_seq' => $changeSeqs[$context->organization],
                 'notice_message' => $noticeState['message'] ?? null,
                 'time' => $now,
+                ...$this->requestBinding($context, $clientMsgId),
                 ...$conversationState,
             ];
         });
@@ -390,21 +597,53 @@ final class MessageService
 
     public function screenshot(AuthContext $context, array $data): array
     {
+        $clientMsgId = $this->requireOperationClientMsgId($data, 'SCREENSHOT');
         $conversationId = trim((string) ($data['conversation_id'] ?? ''));
         if ($conversationId === '') {
             throw new ImException('缺少 conversation_id', 'SCREENSHOT_CONVERSATION_ID_EMPTY');
         }
 
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+        );
         $this->messageShardRouter->writeTable($context->organization, $conversationId, $this->now());
         $this->messageShardRouter->assertIndexTableReady();
-        return $this->repository->transaction(function () use ($context, $conversationId): array {
+        return $this->repository->transaction(function () use (
+            $context,
+            $conversationId,
+            $clientMsgId,
+            $accessPreview,
+        ): array {
+            $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
+            $access = $this->conversationAccess->assertAccessible(
+                $context->organization,
+                $conversationId,
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
             $conversation = $this->findVisibleConversation($context, $conversationId);
             $conversationType = (int) $conversation['conversation_type'];
-            if (!$this->messageNoticeEnabled($context->organization, self::NOTICE_SCREENSHOT, $conversationType)) {
+            if ($access['is_cross_organization']) {
+                $screenshotNoticeRequired = $this->messageNoticeRequiredByAnyHome(
+                    $this->lockHomeMessageOperationConfigs($access['home_organizations']),
+                    self::NOTICE_SCREENSHOT,
+                    $conversationType,
+                );
+            } else {
+                $screenshotNoticeRequired = $this->messageNoticeEnabled(
+                    $context->organization,
+                    self::NOTICE_SCREENSHOT,
+                    $conversationType,
+                );
+            }
+            if (!$screenshotNoticeRequired) {
                 return [
                     'conversation_id' => $conversationId,
                     'recipient_user_ids' => [],
                     'enabled' => false,
+                    ...$this->requestBinding($context, $clientMsgId),
                 ];
             }
 
@@ -412,7 +651,11 @@ final class MessageService
                 $context,
                 $conversationId,
                 $conversationType,
+                $access['home_organizations'],
+                $access['is_cross_organization'] ? $access['access_snapshot_id'] : null,
                 self::NOTICE_SCREENSHOT,
+                [],
+                $this->screenshotSystemClientMsgId($context, $clientMsgId),
             );
 
             return [
@@ -421,6 +664,7 @@ final class MessageService
                 'enabled' => true,
                 'notice_message' => $noticeState['message'] ?? null,
                 'time' => $noticeState['last_message_time'] ?? $this->now(),
+                ...$this->requestBinding($context, $clientMsgId),
                 ...$noticeState,
             ];
         });
@@ -428,6 +672,7 @@ final class MessageService
 
     public function delete(AuthContext $context, array $data): array
     {
+        $clientMsgId = $this->requireOperationClientMsgId($data, 'DELETE');
         $messageId = trim((string) ($data['message_id'] ?? ''));
         if ($messageId === '') {
             throw new ImException('缺少 message_id', 'DELETE_MESSAGE_ID_EMPTY');
@@ -439,9 +684,36 @@ final class MessageService
         }
 
         $this->messageShardRouter->assertIndexTableReady();
+        $previewMessage = $this->findVisibleMessage($context, $messageId);
+        $conversationId = (string) $previewMessage['conversation_id'];
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+        );
 
-        return $this->repository->transaction(function () use ($context, $messageId, $scope): array {
-            $message = $this->findVisibleMessage($context, $messageId, true);
+        return $this->repository->transaction(function () use (
+            $context,
+            $messageId,
+            $scope,
+            $clientMsgId,
+            $conversationId,
+            $accessPreview,
+        ): array {
+            $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
+            $access = $this->conversationAccess->assertAccessible(
+                $context->organization,
+                $conversationId,
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
+            $preview = $this->findVisibleMessage($context, $messageId);
+            $homeMessages = $this->messageHomeProjections(
+                $preview,
+                $access['home_organizations'],
+            );
+            $message = $homeMessages[$context->organization]
+                ?? throw new ImException('当前home消息投影缺失', 'MESSAGE_HOME_PROJECTION_MISSING');
             $now = $this->now();
 
             if ($scope === 'self') {
@@ -451,27 +723,32 @@ final class MessageService
 
                 $this->repository->execute(
                     'INSERT INTO im_message_user_delete
-                        (organization, conversation_id, message_id, user_id, delete_time, create_time)
-                     VALUES (?, ?, ?, ?, ?, ?)
+                        (organization, conversation_id, message_id, user_id, user_organization, delete_time, create_time)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE delete_time = VALUES(delete_time)',
                     [
                         $context->organization,
                         (string) $message['conversation_id'],
                         $messageId,
                         $context->userId,
+                        $context->organization,
                         $now,
                         $now,
                     ],
                 );
 
-                $changeSeq = $this->recordMessageChange(
+                $changeSeqs = $this->recordMessageChanges(
                     context: $context,
-                    message: $message,
+                    homeMessages: [$context->organization => $message],
                     changeType: self::CHANGE_DELETE_SELF,
+                    targetOrganization: $context->organization,
                     targetUserId: $context->userId,
                     payload: ['scope' => 'self'],
                     eventType: Constants::MQ_ROUTING_MESSAGE_DELETED_SELF,
                     now: $now,
+                    crossOrgAccessSnapshotId: $access['is_cross_organization']
+                        ? $access['access_snapshot_id']
+                        : null,
                 );
 
                 return [
@@ -479,50 +756,86 @@ final class MessageService
                     'conversation_id' => (string) $message['conversation_id'],
                     'scope' => 'self',
                     'recipient_user_ids' => [],
-                    'change_seq' => $changeSeq,
+                    'change_seq' => $changeSeqs[$context->organization],
                     'time' => $now,
+                    ...$this->requestBinding($context, $clientMsgId),
                 ];
             }
 
-            if (!$this->messageDeleteEnabled($context->organization, 'both')) {
+            if ($access['is_cross_organization']) {
+                $deleteBothEnabled = $this->messageDeleteEnabledForEveryHome(
+                    $this->lockHomeMessageOperationConfigs($access['home_organizations']),
+                    'both',
+                );
+            } else {
+                $deleteBothEnabled = $this->messageDeleteEnabled($context->organization, 'both');
+            }
+            if (!$deleteBothEnabled) {
                 throw new ImException('当前租户未开启双向删除消息', 'DELETE_BOTH_DISABLED');
             }
-            if ((string) $message['sender_id'] !== $context->userId) {
+            if (
+                (int) $message['sender_organization'] !== $context->organization
+                || (string) $message['sender_id'] !== $context->userId
+            ) {
                 throw new ImException('只能双向删除自己发送的消息', 'DELETE_BOTH_FORBIDDEN');
             }
 
-            $affected = $this->repository->execute(
-                'UPDATE ' . $this->messageShardRouter->quote($this->messageTableOf($message)) . '
-                    SET status = ?, update_time = ?, delete_time = ?
-                  WHERE organization = ? AND message_id = ? AND status = ? AND delete_time IS NULL',
-                [self::MESSAGE_DELETED_BOTH, $now, $now, $context->organization, $messageId, self::MESSAGE_NORMAL],
-            );
-            if ($affected !== 1) {
-                throw new ImException('消息状态已被并发修改', 'DELETE_BOTH_CONFLICT');
+            foreach ($homeMessages as $homeOrganization => &$homeMessage) {
+                $affected = $this->repository->execute(
+                    'UPDATE ' . $this->messageShardRouter->quote($this->messageTableOf($homeMessage)) . '
+                        SET status = ?, update_time = ?, delete_time = ?
+                      WHERE organization = ? AND message_id = ? AND status = ? AND delete_time IS NULL',
+                    [
+                        self::MESSAGE_DELETED_BOTH,
+                        $now,
+                        $now,
+                        $homeOrganization,
+                        $messageId,
+                        self::MESSAGE_NORMAL,
+                    ],
+                );
+                if ($affected !== 1) {
+                    throw new ImException('消息状态已被并发修改', 'DELETE_BOTH_CONFLICT');
+                }
+                $homeMessage['status'] = self::MESSAGE_DELETED_BOTH;
+                $homeMessage['update_time'] = $now;
+                $homeMessage['delete_time'] = $now;
             }
-            $changeSeq = $this->recordMessageChange(
+            unset($homeMessage);
+            $changeSeqs = $this->recordMessageChanges(
                 context: $context,
-                message: $message,
+                homeMessages: $homeMessages,
                 changeType: self::CHANGE_DELETE_BOTH,
+                targetOrganization: null,
                 targetUserId: null,
                 payload: ['scope' => 'both', 'status' => 'deleted_both'],
                 eventType: Constants::MQ_ROUTING_MESSAGE_DELETED_BOTH,
                 now: $now,
+                crossOrgAccessSnapshotId: $access['is_cross_organization']
+                    ? $access['access_snapshot_id']
+                    : null,
             );
 
-            $conversationState = $this->refreshConversationLastMessage(
-                $context->organization,
-                (string) $message['conversation_id'],
-                $now,
-            );
+            $conversationState = [];
+            foreach (array_keys($homeMessages) as $homeOrganization) {
+                $state = $this->refreshConversationLastMessage(
+                    (int) $homeOrganization,
+                    (string) $message['conversation_id'],
+                    $now,
+                );
+                if ((int) $homeOrganization === $context->organization) {
+                    $conversationState = $state;
+                }
+            }
 
             return [
                 'message_id' => $messageId,
                 'conversation_id' => (string) $message['conversation_id'],
                 'scope' => 'both',
                 'recipient_user_ids' => $this->conversationMembers($context->organization, (string) $message['conversation_id']),
-                'change_seq' => $changeSeq,
+                'change_seq' => $changeSeqs[$context->organization],
                 'time' => $now,
+                ...$this->requestBinding($context, $clientMsgId),
                 ...$conversationState,
             ];
         });
@@ -530,6 +843,7 @@ final class MessageService
 
     public function edit(AuthContext $context, array $data): array
     {
+        $clientMsgId = $this->requireOperationClientMsgId($data, 'EDIT');
         $messageId = trim((string) ($data['message_id'] ?? ''));
         if ($messageId === '') {
             throw new ImException('缺少 message_id', 'EDIT_MESSAGE_ID_EMPTY');
@@ -549,9 +863,41 @@ final class MessageService
         }
 
         $this->messageShardRouter->assertIndexTableReady();
-        return $this->repository->transaction(function () use ($context, $messageId, $text): array {
-            $message = $this->findVisibleMessage($context, $messageId, true);
-            if ((string) $message['sender_id'] !== $context->userId) {
+        $previewMessage = $this->findVisibleMessage($context, $messageId);
+        $conversationId = (string) $previewMessage['conversation_id'];
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+        );
+        return $this->repository->transaction(function () use (
+            $context,
+            $messageId,
+            $text,
+            $clientMsgId,
+            $conversationId,
+            $accessPreview,
+        ): array {
+            $homePolicies = $this->lockCrossHomeTenantPolicyBoundary(
+                $accessPreview['home_organizations'],
+            );
+            $access = $this->conversationAccess->assertAccessible(
+                $context->organization,
+                $conversationId,
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
+            $preview = $this->findVisibleMessage($context, $messageId);
+            $homeMessages = $this->messageHomeProjections(
+                $preview,
+                $access['home_organizations'],
+            );
+            $message = $homeMessages[$context->organization]
+                ?? throw new ImException('当前home消息投影缺失', 'MESSAGE_HOME_PROJECTION_MISSING');
+            if (
+                (int) $message['sender_organization'] !== $context->organization
+                || (string) $message['sender_id'] !== $context->userId
+            ) {
                 throw new ImException('只能编辑自己发送的消息', 'EDIT_FORBIDDEN');
             }
             if ((int) $message['message_type'] !== MessageType::TEXT) {
@@ -561,11 +907,17 @@ final class MessageService
                 throw new ImException('消息状态不允许编辑', 'EDIT_STATUS_INVALID');
             }
 
-            $editWindowSeconds = $this->tenantImPolicies
-                ->policy($context->organization)
-                ->messageEditWindowSeconds;
-            if ($editWindowSeconds > 0 && strtotime((string) $message['create_time']) + $editWindowSeconds < time()) {
-                throw new ImException('消息已超过可编辑时间', 'EDIT_EXPIRED');
+            $editPolicies = $homePolicies !== []
+                ? $homePolicies
+                : [$context->organization => $this->tenantImPolicies->policy($context->organization)];
+            foreach ($editPolicies as $policy) {
+                $editWindowSeconds = $policy->messageEditWindowSeconds;
+                if (
+                    $editWindowSeconds > 0
+                    && strtotime((string) $message['create_time']) + $editWindowSeconds < time()
+                ) {
+                    throw new ImException('消息已超过任一参与机构允许的编辑时间', 'EDIT_EXPIRED');
+                }
             }
 
             $now = $this->now();
@@ -574,59 +926,75 @@ final class MessageService
             $messageContent['text'] = $text;
             $contentJson = json_encode($messageContent, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
 
-            $affected = $this->repository->execute(
-                'UPDATE ' . $this->messageShardRouter->quote($this->messageTableOf($message)) . '
-                    SET content = ?, edit_time = ?, edit_count = edit_count + 1, update_time = ?
-                  WHERE organization = ? AND message_id = ? AND status = ? AND delete_time IS NULL',
-                [$contentJson, $now, $now, $context->organization, $messageId, self::MESSAGE_NORMAL],
-            );
-            if ($affected !== 1) {
-                throw new ImException('消息状态已被并发修改', 'EDIT_CONFLICT');
+            foreach ($homeMessages as $homeOrganization => &$homeMessage) {
+                $affected = $this->repository->execute(
+                    'UPDATE ' . $this->messageShardRouter->quote($this->messageTableOf($homeMessage)) . '
+                        SET content = ?, edit_time = ?, edit_count = edit_count + 1, update_time = ?
+                      WHERE organization = ? AND message_id = ? AND status = ? AND delete_time IS NULL',
+                    [
+                        $contentJson,
+                        $now,
+                        $now,
+                        $homeOrganization,
+                        $messageId,
+                        self::MESSAGE_NORMAL,
+                    ],
+                );
+                if ($affected !== 1) {
+                    throw new ImException('消息状态已被并发修改', 'EDIT_CONFLICT');
+                }
+                $homeMessage['content'] = $contentJson;
+                $homeMessage['edit_time'] = $now;
+                $homeMessage['edit_count'] = (int) $homeMessage['edit_count'] + 1;
+                $homeMessage['update_time'] = $now;
             }
-
-            $updatedMessage = $this->repository->fetchOne(
-                'SELECT * FROM ' . $this->messageShardRouter->quote($this->messageTableOf($message)) . ' WHERE organization = ? AND message_id = ? LIMIT 1',
-                [$context->organization, $messageId],
-            );
-            if ($updatedMessage === null) {
-                throw new ImException('消息编辑失败', 'EDIT_MESSAGE_NOT_FOUND');
-            }
-            $updatedMessage['_message_table'] = $this->messageTableOf($message);
-            $updatedMessage['global_seq'] = (string) $message['global_seq'];
-            $changeSeq = $this->recordMessageChange(
+            unset($homeMessage);
+            $changeSeqs = $this->recordMessageChanges(
                 context: $context,
-                message: $updatedMessage,
+                homeMessages: $homeMessages,
                 changeType: self::CHANGE_EDIT,
+                targetOrganization: null,
                 targetUserId: null,
                 payload: [
                     'content' => $messageContent,
                     'edit_time' => $now,
-                    'edit_count' => (int) $updatedMessage['edit_count'],
+                    'edit_count' => (int) $homeMessages[$context->organization]['edit_count'],
                 ],
                 eventType: Constants::MQ_ROUTING_MESSAGE_EDITED,
                 now: $now,
+                crossOrgAccessSnapshotId: $access['is_cross_organization']
+                    ? $access['access_snapshot_id']
+                    : null,
             );
 
             $conversationState = [];
-            $conversation = $this->repository->fetchOne(
-                'SELECT last_message_id FROM im_conversation WHERE organization = ? AND conversation_id = ? LIMIT 1',
-                [$context->organization, (string) $message['conversation_id']],
-            );
-            if ($conversation !== null && (string) ($conversation['last_message_id'] ?? '') === $messageId) {
-                $conversationState = $this->refreshConversationLastMessage(
-                    $context->organization,
-                    (string) $message['conversation_id'],
-                    $now,
+            foreach (array_keys($homeMessages) as $homeOrganization) {
+                $conversation = $this->repository->fetchOne(
+                    'SELECT last_message_id FROM im_conversation
+                      WHERE organization = ? AND conversation_id = ? LIMIT 1',
+                    [$homeOrganization, (string) $message['conversation_id']],
                 );
+                if ($conversation !== null && (string) ($conversation['last_message_id'] ?? '') === $messageId) {
+                    $state = $this->refreshConversationLastMessage(
+                        (int) $homeOrganization,
+                        (string) $message['conversation_id'],
+                        $now,
+                    );
+                    if ((int) $homeOrganization === $context->organization) {
+                        $conversationState = $state;
+                    }
+                }
             }
 
             return [
                 'message_id' => $messageId,
                 'conversation_id' => $message['conversation_id'],
                 'recipient_user_ids' => $this->conversationMembers($context->organization, $message['conversation_id']),
-                'message' => $this->formatMessage($updatedMessage),
-                'change_seq' => $changeSeq,
+                'content' => ['text' => $text],
+                'message' => $this->formatMessage($homeMessages[$context->organization]),
+                'change_seq' => $changeSeqs[$context->organization],
                 'time' => $now,
+                ...$this->requestBinding($context, $clientMsgId),
                 ...$conversationState,
             ];
         });
@@ -642,6 +1010,7 @@ final class MessageService
         $this->messageShardRouter->assertIndexTableReady();
 
         if ($conversationId !== '') {
+            $access = $this->conversationAccess->assertAccessible($context->organization, $conversationId);
             $this->assertVisibleMember($context->organization, $conversationId, $context->userId);
             $messagePage = $this->fetchConversationMessages(
                 $context->organization,
@@ -668,15 +1037,34 @@ final class MessageService
                 'next_after_change_seq' => $changePage['next_after_change_seq'],
                 'messages_has_more' => $messagePage['has_more'],
                 'changes_has_more' => $changePage['has_more'],
+                'cross_org_access_snapshot_id' => $access['access_snapshot_id'],
             ];
         }
 
-        $page = $this->fetchGlobalMessages(
-            $context->organization,
-            $context->userId,
-            $afterGlobalSeq,
-            $limit,
-        );
+        $stablePage = null;
+        $stableSnapshotId = '';
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $snapshotBefore = $this->conversationAccess->snapshotId(true);
+            $page = $this->fetchGlobalMessages(
+                $context->organization,
+                $context->userId,
+                $afterGlobalSeq,
+                $limit,
+            );
+            $snapshotAfter = $this->conversationAccess->snapshotId(true);
+            if (hash_equals($snapshotBefore, $snapshotAfter)) {
+                $stablePage = $page;
+                $stableSnapshotId = $snapshotAfter;
+                break;
+            }
+        }
+        if (!is_array($stablePage)) {
+            throw new ImException(
+                '跨机构访问快照持续变化，请重试同步',
+                'CROSS_ORG_ACCESS_SNAPSHOT_UNSTABLE',
+            );
+        }
+        $page = $stablePage;
 
         return [
             'organization' => $context->organization,
@@ -684,17 +1072,29 @@ final class MessageService
             'messages' => array_map(fn (array $message): array => $this->formatMessage($message), $page['messages']),
             'next_after_global_seq' => (string) $page['next_after_global_seq'],
             'has_more' => $page['has_more'],
+            'cross_org_access_snapshot_id' => $stableSnapshotId,
         ];
     }
 
     private function ensureWriteConversationId(AuthContext $context, int $conversationType, array $data): array
     {
         if ($conversationType === self::CONVERSATION_SINGLE) {
-            $toUserId = trim((string) ($data['to_user_id'] ?? $data['receiver_id'] ?? ''));
-            if ($toUserId === '' || $toUserId === $context->userId) {
+            $toUserId = trim((string) ($data['to_user_id'] ?? ''));
+            $toOrganizationValue = $data['to_organization'] ?? null;
+            $toOrganization = is_int($toOrganizationValue) ? $toOrganizationValue : 0;
+            if (
+                $toUserId === ''
+                || $toOrganization <= 0
+                || ($toOrganization === $context->organization && $toUserId === $context->userId)
+            ) {
                 throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
             }
-            $peer = $this->resolveSinglePeer($context->organization, $context->userId, $toUserId);
+            $peer = $this->resolveSinglePeer(
+                $context->organization,
+                $context->userId,
+                $toOrganization,
+                $toUserId,
+            );
             $data['conversation_id'] = $peer['conversation_id'];
             $data['_peer_organization'] = $peer['peer_organization'];
             $data['_is_cross_organization'] = $peer['is_cross_organization'];
@@ -715,6 +1115,7 @@ final class MessageService
         string $messageId,
         int $messageSeq,
         int $globalSeq,
+        int $senderOrganization,
         string $senderId,
         string $clientMsgId,
         string $messageTable,
@@ -725,8 +1126,8 @@ final class MessageService
             fn () => $this->repository->execute(
                 'INSERT INTO `im_message_index`
                 (organization, global_seq, message_id, conversation_id, message_seq,
-                 sender_id, client_msg_id, storage_node, shard_table, create_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                 sender_id, sender_organization, client_msg_id, storage_node, shard_table, create_time)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
                 $organization,
                 $globalSeq,
@@ -734,6 +1135,7 @@ final class MessageService
                 $conversationId,
                 $messageSeq,
                 $senderId,
+                $senderOrganization,
                 $clientMsgId,
                 'mysql-primary',
                 $messageTable,
@@ -753,14 +1155,19 @@ final class MessageService
         );
     }
 
-    private function findMessageByClientMsg(int $organization, string $senderId, string $clientMsgId): ?array
+    private function findMessageByClientMsg(
+        int $organization,
+        int $senderOrganization,
+        string $senderId,
+        string $clientMsgId,
+    ): ?array
     {
         $index = $this->repository->fetchOne(
             'SELECT message_id, global_seq, shard_table
                FROM im_message_index
-              WHERE organization = ? AND sender_id = ? AND client_msg_id = ?
+              WHERE organization = ? AND sender_organization = ? AND sender_id = ? AND client_msg_id = ?
               LIMIT 1',
-            [$organization, $senderId, $clientMsgId],
+            [$organization, $senderOrganization, $senderId, $clientMsgId],
         );
         if ($index === null) {
             return null;
@@ -786,7 +1193,7 @@ final class MessageService
     private function fetchConversationMessages(int $organization, string $conversationId, string $userId, int $afterSeq, int $limit): array
     {
         $candidates = $this->repository->fetchAll(
-            'SELECT i.global_seq, i.message_id, i.message_seq, i.shard_table
+            'SELECT i.global_seq, i.message_id, i.message_seq, i.shard_table, i.conversation_id
                FROM im_message_index i
               WHERE i.organization = ?
                 AND i.conversation_id = ?
@@ -796,6 +1203,7 @@ final class MessageService
                       FROM im_conversation_membership_period mp
                      WHERE mp.organization = i.organization
                        AND mp.conversation_id = i.conversation_id
+                       AND mp.member_organization = ?
                        AND mp.user_id = ?
                        AND mp.status = 1
                        AND i.message_seq >= mp.visible_from_message_seq
@@ -803,7 +1211,7 @@ final class MessageService
                 )
               ORDER BY i.message_seq ASC
               LIMIT ' . ($limit + 1),
-            [$organization, $conversationId, $afterSeq, $userId],
+            [$organization, $conversationId, $afterSeq, $organization, $userId],
         );
 
         return $this->indexedMessagePage($organization, $userId, $candidates, $limit, $afterSeq, 0);
@@ -812,7 +1220,7 @@ final class MessageService
     private function fetchGlobalMessages(int $organization, string $userId, int $afterGlobalSeq, int $limit): array
     {
         $candidates = $this->repository->fetchAll(
-            'SELECT i.global_seq, i.message_id, i.message_seq, i.shard_table
+            'SELECT i.global_seq, i.message_id, i.message_seq, i.shard_table, i.conversation_id
                FROM im_message_index i
               WHERE i.organization = ?
                 AND i.global_seq > ?
@@ -821,6 +1229,7 @@ final class MessageService
                       FROM im_conversation_membership_period mp
                      WHERE mp.organization = i.organization
                        AND mp.conversation_id = i.conversation_id
+                       AND mp.member_organization = ?
                        AND mp.user_id = ?
                        AND mp.status = 1
                        AND i.message_seq >= mp.visible_from_message_seq
@@ -828,7 +1237,7 @@ final class MessageService
                 )
               ORDER BY i.global_seq ASC
               LIMIT ' . ($limit + 1),
-            [$organization, $afterGlobalSeq, $userId],
+            [$organization, $afterGlobalSeq, $organization, $userId],
         );
 
         return $this->indexedMessagePage($organization, $userId, $candidates, $limit, 0, $afterGlobalSeq);
@@ -848,7 +1257,9 @@ final class MessageService
         int $limit,
     ): array {
         $candidates = $this->repository->fetchAll(
-            'SELECT conversation_id, change_seq, message_id, message_seq, change_type, target_user_id, payload_json, create_time
+            'SELECT conversation_id, change_seq, message_id, message_seq, change_type,
+                    actor_organization, actor_user_id, target_organization,
+                    target_user_id, payload_json, create_time
                FROM im_message_change
               WHERE organization = ? AND conversation_id = ? AND change_seq > ?
               ORDER BY change_seq ASC
@@ -863,7 +1274,11 @@ final class MessageService
 
         foreach ($candidates as $candidate) {
             $targetUserId = trim((string) ($candidate['target_user_id'] ?? ''));
-            if ($targetUserId !== '' && $targetUserId !== $userId) {
+            $targetOrganization = (int) ($candidate['target_organization'] ?? 0);
+            if (
+                $targetUserId !== ''
+                && ($targetOrganization !== $organization || $targetUserId !== $userId)
+            ) {
                 continue;
             }
             if (!$this->isMessageSeqVisible(
@@ -885,7 +1300,10 @@ final class MessageService
                 'change_type' => (string) $candidate['change_type'],
                 'message_id' => (string) $candidate['message_id'],
                 'message_seq' => (int) $candidate['message_seq'],
+                'actor_organization' => (int) $candidate['actor_organization'],
+                'actor_user_id' => (string) $candidate['actor_user_id'],
                 'target_user_id' => $targetUserId === '' ? null : $targetUserId,
+                'target_organization' => $targetUserId === '' ? null : $targetOrganization,
                 'payload' => $payload,
                 'create_time' => (string) $candidate['create_time'],
             ];
@@ -919,11 +1337,25 @@ final class MessageService
 
         /** @var array<string, list<string>> $messageIdsByTable */
         $messageIdsByTable = [];
+        $accessibleCandidates = [];
         foreach ($candidates as $candidate) {
+            try {
+                $this->conversationAccess->assertAccessible(
+                    $organization,
+                    (string) ($candidate['conversation_id'] ?? ''),
+                );
+            } catch (ImException $exception) {
+                if (CrossOrganizationConversationAccess::isAccessRevoked($exception)) {
+                    continue;
+                }
+                throw $exception;
+            }
+            $accessibleCandidates[] = $candidate;
             $table = (string) $candidate['shard_table'];
             $this->messageShardRouter->quote($table);
             $messageIdsByTable[$table][] = (string) $candidate['message_id'];
         }
+        $candidates = $accessibleCandidates;
 
         /** @var array<string, array<string, mixed>> $messageBodies */
         $messageBodies = [];
@@ -952,9 +1384,10 @@ final class MessageService
 
             $deleted = $this->repository->fetchOne(
                 'SELECT 1 AS deleted FROM im_message_user_delete
-                  WHERE organization = ? AND message_id = ? AND user_id = ?
+                  WHERE organization = ? AND message_id = ?
+                    AND user_organization = ? AND user_id = ?
                   LIMIT 1',
-                [$organization, $messageId, $userId],
+                [$organization, $messageId, $organization, $userId],
             );
             if ($deleted !== null) {
                 continue;
@@ -974,11 +1407,33 @@ final class MessageService
 
     private function ensureSingleConversation(AuthContext $context, array $data): array
     {
-        $toUserId = trim((string) ($data['to_user_id'] ?? $data['receiver_id'] ?? ''));
-        if ($toUserId === '' || $toUserId === $context->userId) {
+        $toUserId = trim((string) ($data['to_user_id'] ?? ''));
+        $toOrganizationValue = $data['to_organization'] ?? null;
+        $toOrganization = is_int($toOrganizationValue) ? $toOrganizationValue : 0;
+        if (
+            $toUserId === ''
+            || $toOrganization <= 0
+            || ($toOrganization === $context->organization && $toUserId === $context->userId)
+        ) {
             throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
         }
-        $peer = $this->resolveSinglePeer($context->organization, $context->userId, $toUserId);
+        if ($toOrganization !== $context->organization) {
+            // This is deliberately the first database operation in the
+            // cross-home SEND transaction: config -> sorted organizations ->
+            // sorted users/relations -> canonical -> home/member.
+            $this->lockCrossOrganizationSendPrerequisites(
+                $context->organization,
+                $context->userId,
+                $toOrganization,
+                $toUserId,
+            );
+        }
+        $peer = $this->resolveSinglePeer(
+            $context->organization,
+            $context->userId,
+            $toOrganization,
+            $toUserId,
+        );
         $peerOrganization = (int) $peer['peer_organization'];
         $conversationId = (string) $peer['conversation_id'];
         $isCross = (bool) $peer['is_cross_organization'];
@@ -990,20 +1445,68 @@ final class MessageService
         );
 
         $now = $this->now();
+        $participantIdentities = $this->orderedIdentityPair(
+            $context->organization,
+            $context->userId,
+            $peerOrganization,
+            $toUserId,
+        );
         $homes = [$context->organization];
         if ($isCross) {
             $homes[] = $peerOrganization;
             sort($homes);
+            $ordered = $participantIdentities;
+            $this->repository->execute(
+                'INSERT INTO im_cross_organization_conversation
+                    (conversation_id, left_organization, left_user_id, right_organization,
+                     right_user_id, next_message_seq, status, create_time, update_time)
+                 VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+                 ON DUPLICATE KEY UPDATE update_time = VALUES(update_time)',
+                [
+                    $conversationId,
+                    $ordered[0]['organization'],
+                    $ordered[0]['user_id'],
+                    $ordered[1]['organization'],
+                    $ordered[1]['user_id'],
+                    $now,
+                    $now,
+                ],
+            );
+            $canonical = $this->repository->fetchOne(
+                'SELECT * FROM im_cross_organization_conversation
+                  WHERE conversation_id = ? AND status = 1
+                  LIMIT 1 FOR UPDATE',
+                [$conversationId],
+            );
+            if (
+                $canonical === null
+                || (int) $canonical['left_organization'] !== (int) $ordered[0]['organization']
+                || (string) $canonical['left_user_id'] !== (string) $ordered[0]['user_id']
+                || (int) $canonical['right_organization'] !== (int) $ordered[1]['organization']
+                || (string) $canonical['right_user_id'] !== (string) $ordered[1]['user_id']
+            ) {
+                throw new ImException('跨机构单聊身份与会话ID不一致', 'CROSS_ORG_CONVERSATION_IDENTITY_MISMATCH');
+            }
         }
         foreach ($homes as $homeOrg) {
+            $owner = $participantIdentities[0];
             $this->repository->execute(
                 'INSERT INTO im_conversation
-                    (organization, conversation_id, conversation_type, title, owner_user_id, status, create_time, update_time)
-                 VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    (organization, conversation_id, conversation_type, title, owner_user_id,
+                     owner_organization, status, create_time, update_time)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                  ON DUPLICATE KEY UPDATE update_time = VALUES(update_time)',
-                [$homeOrg, $conversationId, self::CONVERSATION_SINGLE, '', $context->userId, $now, $now],
+                [
+                    $homeOrg,
+                    $conversationId,
+                    self::CONVERSATION_SINGLE,
+                    '',
+                    $owner['user_id'],
+                    $owner['organization'],
+                    $now,
+                    $now,
+                ],
             );
-            $this->ensureOrganizationSequence($homeOrg);
             $conversation = $this->repository->fetchOne(
                 'SELECT conversation_type, status FROM im_conversation
                   WHERE organization = ? AND conversation_id = ? AND delete_time IS NULL
@@ -1015,20 +1518,33 @@ final class MessageService
                 || (int) $conversation['status'] !== 1) {
                 throw new ImException('单聊会话不存在、已停用或类型无效', 'SEND_CONVERSATION_INACTIVE');
             }
-            // Each home org records both user_ids so active membership and fanout work.
-            $this->ensureMember($homeOrg, $conversationId, $context->userId, 'owner');
-            $this->ensureMember($homeOrg, $conversationId, $toUserId, 'member');
+            foreach ($participantIdentities as $identity) {
+                $this->ensureMember(
+                    $homeOrg,
+                    $conversationId,
+                    (int) $identity['organization'],
+                    (string) $identity['user_id'],
+                    $homeOrg === (int) $identity['organization'] ? 'owner' : 'member',
+                );
+            }
         }
+
+        $access = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+            $isCross,
+            $isCross ? $homes : null,
+            $isCross ? $participantIdentities : null,
+        );
 
         return [
             'conversation_id' => $conversationId,
             'recipient_user_ids' => [$toUserId],
-            'recipient_homes' => [
-                $toUserId => $peerOrganization,
-                $context->userId => $context->organization,
-            ],
+            'participant_identities' => $participantIdentities,
+            'home_organizations' => $homes,
             'peer_organization' => $peerOrganization,
             'is_cross_organization' => $isCross,
+            'cross_org_access_snapshot_id' => $isCross ? $access['access_snapshot_id'] : null,
         ];
     }
 
@@ -1059,6 +1575,12 @@ final class MessageService
             throw new ImException('群聊会话已停用', 'SEND_CONVERSATION_INACTIVE');
         }
         $this->assertMember($context->organization, $conversationId, $context->userId);
+        $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+            true,
+            [$context->organization],
+        );
         $this->assertConversationWithoutSystemMember($context->organization, $conversationId);
 
         $recipientUserIds = array_values(array_filter(
@@ -1072,33 +1594,94 @@ final class MessageService
         return [
             'conversation_id' => $conversationId,
             'recipient_user_ids' => $recipientUserIds,
+            'participant_identities' => $this->conversationMemberIdentities(
+                $context->organization,
+                $conversationId,
+            ),
+            'home_organizations' => [$context->organization],
+            'cross_org_access_snapshot_id' => null,
         ];
     }
 
-    private function createReceipts(AuthContext $context, string $conversationId, string $messageId, array $recipientUserIds): void
+    /**
+     * @param list<array{organization:int,user_id:string}> $homeIdentities
+     */
+    private function createHomeReceipts(
+        int $homeOrganization,
+        string $conversationId,
+        string $messageId,
+        array $homeIdentities,
+        int $senderOrganization,
+        string $senderUserId,
+    ): void
     {
         $now = $this->now();
-        $this->upsertReceipt($context->organization, $conversationId, $messageId, $context->userId, self::RECEIPT_READ, $now, $now);
-        foreach ($recipientUserIds as $userId) {
-            $this->upsertReceipt($context->organization, $conversationId, $messageId, $userId, self::RECEIPT_SENT, null, null);
+        foreach ($homeIdentities as $identity) {
+            $isSender = $this->sameIdentity($identity, $senderOrganization, $senderUserId);
+            $this->upsertReceipt(
+                $homeOrganization,
+                $conversationId,
+                $messageId,
+                (int) $identity['organization'],
+                (string) $identity['user_id'],
+                $isSender ? self::RECEIPT_READ : self::RECEIPT_SENT,
+                $isSender ? $now : null,
+                $isSender ? $now : null,
+            );
         }
     }
 
-    private function allocateMessageSeq(int $organization, string $conversationId): int
+    /**
+     * @param list<int> $homeOrganizations
+     */
+    private function allocateMessageSeq(string $conversationId, array $homeOrganizations): int
     {
-        $row = $this->repository->fetchOne(
-            'SELECT next_message_seq FROM im_conversation WHERE organization = ? AND conversation_id = ? FOR UPDATE',
-            [$organization, $conversationId],
-        );
-        if ($row === null) {
-            throw new ImException('会话不存在，无法分配消息序号', 'CONVERSATION_NOT_FOUND');
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if (count($homeOrganizations) > 1) {
+            $row = $this->repository->fetchOne(
+                'SELECT next_message_seq
+                   FROM im_cross_organization_conversation
+                  WHERE conversation_id = ? AND status = 1
+                  LIMIT 1 FOR UPDATE',
+                [$conversationId],
+            );
+            if ($row === null) {
+                throw new ImException('跨机构会话序号所有者不存在', 'CROSS_ORG_SEQUENCE_NOT_FOUND');
+            }
+            $messageSeq = max((int) $row['next_message_seq'], 1);
+            $this->repository->execute(
+                'UPDATE im_cross_organization_conversation
+                    SET next_message_seq = ?, update_time = ?
+                  WHERE conversation_id = ? AND status = 1',
+                [$messageSeq + 1, $this->now(), $conversationId],
+            );
+        } else {
+            $organization = $homeOrganizations[0] ?? 0;
+            $row = $this->repository->fetchOne(
+                'SELECT next_message_seq
+                   FROM im_conversation
+                  WHERE organization = ? AND conversation_id = ?
+                  FOR UPDATE',
+                [$organization, $conversationId],
+            );
+            if ($row === null) {
+                throw new ImException('会话不存在，无法分配消息序号', 'CONVERSATION_NOT_FOUND');
+            }
+            $messageSeq = max((int) $row['next_message_seq'], 1);
         }
 
-        $messageSeq = max((int) $row['next_message_seq'], 1);
-        $this->repository->execute(
-            'UPDATE im_conversation SET next_message_seq = ? WHERE organization = ? AND conversation_id = ?',
-            [$messageSeq + 1, $organization, $conversationId],
-        );
+        foreach ($homeOrganizations as $organization) {
+            $affected = $this->repository->execute(
+                'UPDATE im_conversation
+                    SET next_message_seq = ?, update_time = ?
+                  WHERE organization = ? AND conversation_id = ? AND status = 1',
+                [$messageSeq + 1, $this->now(), $organization, $conversationId],
+            );
+            if ($affected !== 1) {
+                throw new ImException('会话home投影缺失', 'CONVERSATION_HOME_PROJECTION_MISSING');
+            }
+        }
 
         return $messageSeq;
     }
@@ -1153,68 +1736,105 @@ final class MessageService
      * @param array<string, mixed> $message
      * @param array<string, mixed> $payload
      */
-    private function recordMessageChange(
+    /**
+     * @param array<int,array<string,mixed>> $homeMessages home organization => message row
+     * @return array<int,int> home organization => independent change_seq
+     */
+    private function recordMessageChanges(
         AuthContext $context,
-        array $message,
+        array $homeMessages,
         string $changeType,
+        ?int $targetOrganization,
         ?string $targetUserId,
         array $payload,
         string $eventType,
         string $now,
-    ): int {
-        $conversationId = (string) $message['conversation_id'];
-        $conversation = $this->repository->fetchOne(
-            'SELECT next_change_seq
-               FROM im_conversation
-              WHERE organization = ? AND conversation_id = ?
-              FOR UPDATE',
-            [$context->organization, $conversationId],
-        );
-        if ($conversation === null) {
-            throw new ImException('会话不存在，无法分配变更序号', 'CONVERSATION_NOT_FOUND');
+        ?string $crossOrgAccessSnapshotId,
+    ): array {
+        if ($homeMessages === []) {
+            throw new ImException('消息home投影缺失', 'MESSAGE_HOME_PROJECTION_MISSING');
+        }
+        ksort($homeMessages, SORT_NUMERIC);
+        $changeSeqs = [];
+        foreach ($homeMessages as $homeOrganization => $message) {
+            $homeOrganization = (int) $homeOrganization;
+            $conversationId = (string) $message['conversation_id'];
+            $conversation = $this->repository->fetchOne(
+                'SELECT next_change_seq
+                   FROM im_conversation
+                  WHERE organization = ? AND conversation_id = ?
+                  FOR UPDATE',
+                [$homeOrganization, $conversationId],
+            );
+            if ($conversation === null) {
+                throw new ImException('会话不存在，无法分配变更序号', 'CONVERSATION_NOT_FOUND');
+            }
+
+            $changeSeq = max((int) $conversation['next_change_seq'], 1);
+            $this->repository->execute(
+                'UPDATE im_conversation
+                    SET next_change_seq = ?, last_change_seq = ?, update_time = ?
+                  WHERE organization = ? AND conversation_id = ?',
+                [$changeSeq + 1, $changeSeq, $now, $homeOrganization, $conversationId],
+            );
+            $this->repository->execute(
+                'INSERT INTO im_message_change
+                    (organization, conversation_id, change_seq, message_id, message_seq,
+                     change_type, actor_organization, actor_user_id, target_user_id,
+                     target_organization, payload_json, create_time)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [
+                    $homeOrganization,
+                    $conversationId,
+                    $changeSeq,
+                    (string) $message['message_id'],
+                    (int) $message['message_seq'],
+                    $changeType,
+                    $context->organization,
+                    $context->userId,
+                    $targetUserId,
+                    $targetOrganization,
+                    json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+                    $now,
+                ],
+            );
+            $realtimePayload = $payload;
+            if ($eventType === Constants::MQ_ROUTING_MESSAGE_EDITED) {
+                $realtimePayload['message'] = $this->formatMessage($message);
+            }
+            $recipientIdentities = $targetUserId === null
+                ? $this->homeRecipientIdentities(
+                    $homeOrganization,
+                    (int) $message['conversation_type'],
+                    $this->conversationMemberIdentities($homeOrganization, $conversationId),
+                )
+                : (
+                    $targetOrganization === $homeOrganization
+                        ? [[
+                            'organization' => $targetOrganization,
+                            'user_id' => $targetUserId,
+                        ]]
+                        : []
+                );
+            $this->outbox->createMessageChanged(
+                context: $context,
+                homeOrganization: $homeOrganization,
+                eventType: $eventType,
+                messageId: (string) $message['message_id'],
+                conversationId: $conversationId,
+                conversationType: (int) $message['conversation_type'],
+                messageSeq: (int) $message['message_seq'],
+                changeSeq: $changeSeq,
+                targetOrganization: $targetOrganization,
+                targetUserId: $targetUserId,
+                payload: $realtimePayload,
+                recipientIdentities: $recipientIdentities,
+                crossOrgAccessSnapshotId: $crossOrgAccessSnapshotId,
+            );
+            $changeSeqs[$homeOrganization] = $changeSeq;
         }
 
-        $changeSeq = max((int) $conversation['next_change_seq'], 1);
-        $this->repository->execute(
-            'UPDATE im_conversation
-                SET next_change_seq = ?, last_change_seq = ?, update_time = ?
-              WHERE organization = ? AND conversation_id = ?',
-            [$changeSeq + 1, $changeSeq, $now, $context->organization, $conversationId],
-        );
-        $this->repository->execute(
-            'INSERT INTO im_message_change
-                (organization, conversation_id, change_seq, message_id, message_seq,
-                 change_type, target_user_id, payload_json, create_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [
-                $context->organization,
-                $conversationId,
-                $changeSeq,
-                (string) $message['message_id'],
-                (int) $message['message_seq'],
-                $changeType,
-                $targetUserId,
-                json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-                $now,
-            ],
-        );
-        $realtimePayload = $payload;
-        if ($eventType === Constants::MQ_ROUTING_MESSAGE_EDITED) {
-            $realtimePayload['message'] = $this->formatMessage($message);
-        }
-        $this->outbox->createMessageChanged(
-            context: $context,
-            eventType: $eventType,
-            messageId: (string) $message['message_id'],
-            conversationId: $conversationId,
-            conversationType: (int) $message['conversation_type'],
-            messageSeq: (int) $message['message_seq'],
-            changeSeq: $changeSeq,
-            targetUserId: $targetUserId,
-            payload: $realtimePayload,
-        );
-
-        return $changeSeq;
+        return $changeSeqs;
     }
 
     private function latestChangeSeq(
@@ -1248,34 +1868,68 @@ final class MessageService
         return (int) $row['change_seq'];
     }
 
-    private function upsertReceipt(int $organization, string $conversationId, string $messageId, string $userId, int $status, ?string $deliveredTime, ?string $readTime): void
+    private function upsertReceipt(
+        int $organization,
+        string $conversationId,
+        string $messageId,
+        int $userOrganization,
+        string $userId,
+        int $status,
+        ?string $deliveredTime,
+        ?string $readTime,
+    ): void
     {
         $now = $this->now();
         $this->repository->execute(
             'INSERT INTO im_message_receipt
-                (organization, conversation_id, message_id, user_id, status, delivered_time, read_time, create_time, update_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (organization, conversation_id, message_id, user_id, user_organization,
+                 status, delivered_time, read_time, create_time, update_time)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
+                status = GREATEST(status, VALUES(status)),
                 delivered_time = COALESCE(delivered_time, VALUES(delivered_time)),
                 read_time = COALESCE(read_time, VALUES(read_time)),
                 update_time = VALUES(update_time)',
-            [$organization, $conversationId, $messageId, $userId, $status, $deliveredTime, $readTime, $now, $now],
+            [
+                $organization,
+                $conversationId,
+                $messageId,
+                $userId,
+                $userOrganization,
+                $status,
+                $deliveredTime,
+                $readTime,
+                $now,
+                $now,
+            ],
         );
     }
 
-    private function increaseUnread(int $organization, string $conversationId, array $recipientUserIds): void
+    /**
+     * @param list<array{organization:int,user_id:string}> $recipientIdentities
+     */
+    private function increaseUnread(int $organization, string $conversationId, array $recipientIdentities): void
     {
-        if (empty($recipientUserIds)) {
+        if (empty($recipientIdentities)) {
             return;
         }
 
-        $placeholders = implode(',', array_fill(0, count($recipientUserIds), '?'));
-        $this->repository->execute(
-            'UPDATE im_conversation_member
-                SET unread_count = unread_count + 1, update_time = ?
-              WHERE organization = ? AND conversation_id = ? AND user_id IN (' . $placeholders . ') AND status = 1 AND delete_time IS NULL',
-            array_merge([$this->now(), $organization, $conversationId], $recipientUserIds),
-        );
+        foreach ($recipientIdentities as $identity) {
+            $this->repository->execute(
+                'UPDATE im_conversation_member
+                    SET unread_count = unread_count + 1, update_time = ?
+                  WHERE organization = ? AND conversation_id = ?
+                    AND member_organization = ? AND user_id = ?
+                    AND status = 1 AND delete_time IS NULL',
+                [
+                    $this->now(),
+                    $organization,
+                    $conversationId,
+                    (int) $identity['organization'],
+                    (string) $identity['user_id'],
+                ],
+            );
+        }
     }
 
     /**
@@ -1286,7 +1940,9 @@ final class MessageService
      * @return array{last_read_message_id: string, last_read_seq: int, unread_count: int}
      */
     private function advanceReadState(
-        AuthContext $context,
+        int $homeOrganization,
+        int $userOrganization,
+        string $userId,
         string $conversationId,
         string $requestedMessageId,
         int $requestedSeq,
@@ -1302,11 +1958,12 @@ final class MessageService
                  AND c.delete_time IS NULL
               WHERE cm.organization = ?
                 AND cm.conversation_id = ?
+                AND cm.member_organization = ?
                 AND cm.user_id = ?
                 AND cm.status = 1
                 AND cm.delete_time IS NULL
               LIMIT 1 FOR UPDATE',
-            [$context->organization, $conversationId, $context->userId],
+            [$homeOrganization, $conversationId, $userOrganization, $userId],
         );
         if ($member === null) {
             throw new ImException('会话不存在或无权访问', 'CONVERSATION_READ_MEMBER_NOT_FOUND');
@@ -1321,9 +1978,10 @@ final class MessageService
             $effectiveMessageId = $requestedMessageId;
         }
         $unreadCount = $this->countUnreadAfter(
-            $context->organization,
+            $homeOrganization,
             $conversationId,
-            $context->userId,
+            $userOrganization,
+            $userId,
             $effectiveSeq,
         );
         $this->repository->execute(
@@ -1331,6 +1989,7 @@ final class MessageService
                 SET last_read_message_id = ?, last_read_seq = ?, unread_count = ?, update_time = ?
               WHERE organization = ?
                 AND conversation_id = ?
+                AND member_organization = ?
                 AND user_id = ?
                 AND status = 1
                 AND delete_time IS NULL',
@@ -1339,9 +1998,10 @@ final class MessageService
                 $effectiveSeq,
                 $unreadCount,
                 $now,
-                $context->organization,
+                $homeOrganization,
                 $conversationId,
-                $context->userId,
+                $userOrganization,
+                $userId,
             ],
         );
 
@@ -1353,8 +2013,9 @@ final class MessageService
     }
 
     private function countUnreadAfter(
-        int $organization,
+        int $homeOrganization,
         string $conversationId,
+        int $userOrganization,
         string $userId,
         int $afterSeq,
     ): int {
@@ -1364,11 +2025,12 @@ final class MessageService
               WHERE i.organization = ?
                 AND i.conversation_id = ?
                 AND i.message_seq > ?
-                AND i.sender_id <> ?
+                AND NOT (i.sender_organization = ? AND i.sender_id = ?)
                 AND EXISTS (
                     SELECT 1 FROM im_conversation_membership_period mp
                      WHERE mp.organization = i.organization
                        AND mp.conversation_id = i.conversation_id
+                       AND mp.member_organization = ?
                        AND mp.user_id = ?
                        AND mp.status = 1
                        AND i.message_seq >= mp.visible_from_message_seq
@@ -1378,6 +2040,7 @@ final class MessageService
                     SELECT 1 FROM im_message_user_delete ud
                      WHERE ud.organization = i.organization
                        AND ud.message_id = i.message_id
+                       AND ud.user_organization = ?
                        AND ud.user_id = ?
                 )
                 AND NOT EXISTS (
@@ -1386,7 +2049,18 @@ final class MessageService
                        AND mc.message_id = i.message_id
                        AND mc.change_type = ?
                 )',
-            [$organization, $conversationId, $afterSeq, $userId, $userId, $userId, self::CHANGE_DELETE_BOTH],
+            [
+                $homeOrganization,
+                $conversationId,
+                $afterSeq,
+                $userOrganization,
+                $userId,
+                $userOrganization,
+                $userId,
+                $userOrganization,
+                $userId,
+                self::CHANGE_DELETE_BOTH,
+            ],
         );
 
         return max(0, (int) ($row['aggregate'] ?? 0));
@@ -1395,35 +2069,62 @@ final class MessageService
     private function ensureMember(
         int $organization,
         string $conversationId,
+        int $memberOrganization,
         string $userId,
         string $memberRole,
+        int $inviterOrganization = 0,
         ?string $inviterUserId = null,
     ): void
     {
         $now = $this->now();
         $member = $this->repository->fetchOne(
             'SELECT id, status, delete_time
-               FROM im_conversation_member
-              WHERE organization = ? AND conversation_id = ? AND user_id = ?
+              FROM im_conversation_member
+              WHERE organization = ? AND conversation_id = ?
+                AND member_organization = ? AND user_id = ?
               LIMIT 1
               FOR UPDATE',
-            [$organization, $conversationId, $userId],
+            [$organization, $conversationId, $memberOrganization, $userId],
         );
 
         if ($member === null) {
             $this->repository->execute(
                 'INSERT INTO im_conversation_member
-                    (organization, conversation_id, user_id, member_role, inviter_user_id, status,
+                    (organization, conversation_id, user_id, member_organization, member_role,
+                     inviter_user_id, inviter_organization, status,
                      mute_status, mute_until, access_version, join_at, create_time, update_time)
-                 VALUES (?, ?, ?, ?, ?, 1, 0, NULL, 1, ?, ?, ?)',
-                [$organization, $conversationId, $userId, $memberRole, $inviterUserId, $now, $now, $now],
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, 1, ?, ?, ?)',
+                [
+                    $organization,
+                    $conversationId,
+                    $userId,
+                    $memberOrganization,
+                    $memberRole,
+                    $inviterUserId,
+                    $inviterOrganization,
+                    $now,
+                    $now,
+                    $now,
+                ],
             );
-            $this->ensureMembershipPeriod($organization, $conversationId, $userId, $now);
+            $this->ensureMembershipPeriod(
+                $organization,
+                $conversationId,
+                $memberOrganization,
+                $userId,
+                $now,
+            );
             return;
         }
 
         if ((int) $member['status'] === 1 && empty($member['delete_time'])) {
-            $this->ensureMembershipPeriod($organization, $conversationId, $userId, $now);
+            $this->ensureMembershipPeriod(
+                $organization,
+                $conversationId,
+                $memberOrganization,
+                $userId,
+                $now,
+            );
             return;
         }
 
@@ -1432,6 +2133,7 @@ final class MessageService
                 SET status = 1,
                     member_role = ?,
                     inviter_user_id = ?,
+                    inviter_organization = ?,
                     mute_status = 0,
                     mute_until = NULL,
                     access_version = access_version + 1,
@@ -1439,23 +2141,36 @@ final class MessageService
                     delete_time = NULL,
                     update_time = ?
               WHERE id = ?',
-            [$memberRole, $inviterUserId, $now, $now, (int) $member['id']],
+            [$memberRole, $inviterUserId, $inviterOrganization, $now, $now, (int) $member['id']],
         );
-        $this->ensureMembershipPeriod($organization, $conversationId, $userId, $now);
+        $this->ensureMembershipPeriod(
+            $organization,
+            $conversationId,
+            $memberOrganization,
+            $userId,
+            $now,
+        );
     }
 
-    private function ensureMembershipPeriod(int $organization, string $conversationId, string $userId, string $now): void
+    private function ensureMembershipPeriod(
+        int $organization,
+        string $conversationId,
+        int $memberOrganization,
+        string $userId,
+        string $now,
+    ): void
     {
         $openPeriod = $this->repository->fetchOne(
             'SELECT id
                FROM im_conversation_membership_period
               WHERE organization = ?
                 AND conversation_id = ?
+                AND member_organization = ?
                 AND user_id = ?
                 AND status = 1
                 AND visible_until_message_seq IS NULL
               LIMIT 1',
-            [$organization, $conversationId, $userId],
+            [$organization, $conversationId, $memberOrganization, $userId],
         );
         if ($openPeriod !== null) {
             return;
@@ -1479,19 +2194,21 @@ final class MessageService
         $period = $this->repository->fetchOne(
             'SELECT COALESCE(MAX(period_no), 0) + 1 AS next_period_no
                FROM im_conversation_membership_period
-              WHERE organization = ? AND conversation_id = ? AND user_id = ?',
-            [$organization, $conversationId, $userId],
+              WHERE organization = ? AND conversation_id = ?
+                AND member_organization = ? AND user_id = ?',
+            [$organization, $conversationId, $memberOrganization, $userId],
         );
 
         $this->repository->execute(
             'INSERT INTO im_conversation_membership_period
-                (organization, conversation_id, user_id, period_no, visible_from_message_seq,
+                (organization, conversation_id, user_id, member_organization, period_no, visible_from_message_seq,
                  visible_until_message_seq, join_at, leave_at, status, create_time, update_time)
-             VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 1, ?, ?)',
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 1, ?, ?)',
             [
                 $organization,
                 $conversationId,
                 $userId,
+                $memberOrganization,
                 max((int) ($period['next_period_no'] ?? 1), 1),
                 (int) $conversation['conversation_type'] === self::CONVERSATION_SINGLE
                     || (string) ($conversation['history_visibility'] ?? 'since_join') === 'all'
@@ -1508,8 +2225,10 @@ final class MessageService
     {
         $member = $this->repository->fetchOne(
             'SELECT id, mute_status, mute_until FROM im_conversation_member
-              WHERE organization = ? AND conversation_id = ? AND user_id = ? AND status = 1 AND delete_time IS NULL LIMIT 1',
-            [$organization, $conversationId, $userId],
+              WHERE organization = ? AND conversation_id = ?
+                AND member_organization = ? AND user_id = ?
+                AND status = 1 AND delete_time IS NULL LIMIT 1',
+            [$organization, $conversationId, $organization, $userId],
         );
         if ($member === null) {
             throw new ImException('没有该会话的发送权限', 'CONVERSATION_MEMBER_FORBIDDEN');
@@ -1523,8 +2242,9 @@ final class MessageService
             $this->repository->execute(
                 'UPDATE im_conversation_member
                     SET mute_status = 0, mute_until = NULL, update_time = ?
-                  WHERE organization = ? AND conversation_id = ? AND user_id = ? AND delete_time IS NULL',
-                [$this->now(), $organization, $conversationId, $userId],
+                  WHERE organization = ? AND conversation_id = ?
+                    AND member_organization = ? AND user_id = ? AND delete_time IS NULL',
+                [$this->now(), $organization, $conversationId, $organization, $userId],
             );
             return;
         }
@@ -1536,8 +2256,9 @@ final class MessageService
     {
         $member = $this->repository->fetchOne(
             'SELECT id FROM im_conversation_membership_period
-              WHERE organization = ? AND conversation_id = ? AND user_id = ? AND status = 1 LIMIT 1',
-            [$organization, $conversationId, $userId],
+              WHERE organization = ? AND conversation_id = ?
+                AND member_organization = ? AND user_id = ? AND status = 1 LIMIT 1',
+            [$organization, $conversationId, $organization, $userId],
         );
         if ($member === null) {
             throw new ImException('没有该会话的访问权限', 'CONVERSATION_MEMBER_FORBIDDEN');
@@ -1551,12 +2272,13 @@ final class MessageService
                FROM im_conversation_membership_period
               WHERE organization = ?
                 AND conversation_id = ?
+                AND member_organization = ?
                 AND user_id = ?
                 AND status = 1
                 AND ? >= visible_from_message_seq
                 AND (visible_until_message_seq IS NULL OR ? <= visible_until_message_seq)
               LIMIT 1',
-            [$organization, $conversationId, $userId, $messageSeq, $messageSeq],
+            [$organization, $conversationId, $organization, $userId, $messageSeq, $messageSeq],
         ) !== null;
     }
 
@@ -1567,6 +2289,7 @@ final class MessageService
               INNER JOIN im_conversation_member cm
                 ON cm.organization = c.organization
                AND cm.conversation_id = c.conversation_id
+               AND cm.member_organization = ?
                AND cm.user_id = ?
                AND cm.status = 1
                AND cm.delete_time IS NULL
@@ -1575,11 +2298,13 @@ final class MessageService
                 AND c.status = 1
                 AND c.delete_time IS NULL
               LIMIT 1',
-            [$context->userId, $context->organization, $conversationId],
+            [$context->organization, $context->userId, $context->organization, $conversationId],
         );
         if ($conversation === null) {
             throw new ImException('会话不存在或无权访问', 'CONVERSATION_NOT_FOUND');
         }
+
+        $this->conversationAccess->assertAccessible($context->organization, $conversationId);
 
         return $conversation;
     }
@@ -1623,6 +2348,98 @@ final class MessageService
         }
     }
 
+    private function lockCrossOrganizationSendPrerequisites(
+        int $organization,
+        string $senderId,
+        int $peerOrganization,
+        string $recipientId,
+    ): void {
+        $this->conversationAccess->lockCrossOrganizationWriteBoundary([
+            $organization,
+            $peerOrganization,
+        ]);
+        $this->lockHomeTenantPolicies([$organization, $peerOrganization]);
+
+        $users = [];
+        foreach ($this->orderedIdentityPair(
+            $organization,
+            $senderId,
+            $peerOrganization,
+            $recipientId,
+        ) as $identity) {
+            $row = $this->repository->fetchOne(
+                'SELECT organization, user_id, status, is_system, delete_time
+                   FROM im_user
+                  WHERE organization = ? AND user_id = ?
+                  LIMIT 1 LOCK IN SHARE MODE',
+                [$identity['organization'], $identity['user_id']],
+            );
+            if ($row === null) {
+                throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
+            }
+            $users[(int) $row['organization'] . ':' . (string) $row['user_id']] = $row;
+        }
+        $sender = $users[$organization . ':' . $senderId] ?? null;
+        $recipient = $users[$peerOrganization . ':' . $recipientId] ?? null;
+        if (
+            $sender === null
+            || $recipient === null
+            || (int) ($sender['status'] ?? 0) !== 1
+            || (int) ($recipient['status'] ?? 0) !== 1
+            || ($sender['delete_time'] ?? null) !== null
+            || ($recipient['delete_time'] ?? null) !== null
+        ) {
+            throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
+        }
+        if ((int) ($recipient['is_system'] ?? 2) === 1) {
+            return;
+        }
+
+        $relations = [];
+        foreach ($this->canonicalFriendDirections(
+            $organization,
+            $senderId,
+            $peerOrganization,
+            $recipientId,
+        ) as $direction) {
+            $relations[] = $this->repository->fetchOne(
+                'SELECT organization, user_id, friend_organization, friend_user_id,
+                        status, delete_time
+                   FROM im_friend_relation
+                  WHERE organization = ?
+                    AND user_id = ?
+                    AND friend_organization = ?
+                    AND friend_user_id = ?
+                  LIMIT 1
+                  FOR UPDATE',
+                [
+                    $direction['organization'],
+                    $direction['user_id'],
+                    $direction['friend_organization'],
+                    $direction['friend_user_id'],
+                ],
+            );
+        }
+        // Do not short-circuit the locking reads above: both exact directional
+        // rows or gaps must be acquired in canonical order even when one is
+        // absent.
+        foreach ($relations as $relation) {
+            if ($relation === null) {
+                throw new ImException(
+                    '建立双向好友关系后才能发送单聊消息',
+                    'SEND_SINGLE_FRIEND_REQUIRED',
+                );
+            }
+            if (
+                (int) ($relation['status'] ?? 0) !== 1
+                || ($relation['delete_time'] ?? null) !== null
+            ) {
+                throw new ImException('好友关系已被拉黑或停用', 'SEND_SINGLE_RELATION_BLOCKED');
+            }
+        }
+
+    }
+
     private function assertSingleRelationship(
         int $organization,
         string $senderId,
@@ -1642,19 +2459,21 @@ final class MessageService
             'SELECT status, friend_organization FROM im_friend_relation
               WHERE organization = ?
                 AND user_id = ?
+                AND friend_organization = ?
                 AND friend_user_id = ?
                 AND delete_time IS NULL
               LIMIT 1',
-            [$organization, $senderId, $recipientId],
+            [$organization, $senderId, $peerOrganization, $recipientId],
         );
         $reverse = $this->repository->fetchOne(
             'SELECT status FROM im_friend_relation
               WHERE organization = ?
                 AND user_id = ?
+                AND friend_organization = ?
                 AND friend_user_id = ?
                 AND delete_time IS NULL
               LIMIT 1',
-            [$peerOrganization, $recipientId, $senderId],
+            [$peerOrganization, $recipientId, $organization, $senderId],
         );
         if ($forward === null || $reverse === null) {
             throw new ImException('建立双向好友关系后才能发送单聊消息', 'SEND_SINGLE_FRIEND_REQUIRED');
@@ -1667,70 +2486,39 @@ final class MessageService
     /**
      * @return array{conversation_id: string, peer_organization: int, is_cross_organization: bool}
      */
-    private function resolveSinglePeer(int $organization, string $senderId, string $toUserId): array
+    private function resolveSinglePeer(
+        int $organization,
+        string $senderId,
+        int $toOrganization,
+        string $toUserId,
+    ): array
     {
-        $sameOrg = $this->repository->fetchOne(
+        if ($toOrganization <= 0) {
+            throw new ImException('单聊接收机构无效', 'SEND_SINGLE_RECEIVER_ORGANIZATION_INVALID');
+        }
+        if ($toOrganization !== $organization && !$this->crossOrgSocial->isEnabled(true)) {
+            throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
+        }
+
+        $active = $this->repository->fetchOne(
             'SELECT user_id FROM im_user
               WHERE organization = ? AND user_id = ? AND status = 1 AND delete_time IS NULL
               LIMIT 1',
-            [$organization, $toUserId],
+            [$toOrganization, $toUserId],
         );
-        if ($sameOrg !== null) {
-            return [
-                'conversation_id' => self::singleConversationId($organization, $senderId, $toUserId),
-                'peer_organization' => $organization,
-                'is_cross_organization' => false,
-            ];
-        }
-
-        $friend = $this->repository->fetchOne(
-            'SELECT friend_organization FROM im_friend_relation
-              WHERE organization = ?
-                AND user_id = ?
-                AND friend_user_id = ?
-                AND status = 1
-                AND delete_time IS NULL
-              LIMIT 1',
-            [$organization, $senderId, $toUserId],
-        );
-        $peerOrganization = (int) ($friend['friend_organization'] ?? 0);
-        if ($peerOrganization <= 0) {
-            $any = $this->repository->fetchOne(
-                'SELECT organization FROM im_user
-                  WHERE user_id = ? AND status = 1 AND delete_time IS NULL
-                  LIMIT 1',
-                [$toUserId],
-            );
-            $peerOrganization = (int) ($any['organization'] ?? 0);
-        }
-        if ($peerOrganization <= 0) {
+        if ($active === null) {
             throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
-        }
-        if ($peerOrganization !== $organization) {
-            if (!$this->crossOrgSocial->isEnabled()) {
-                throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
-            }
-            $active = $this->repository->fetchOne(
-                'SELECT user_id FROM im_user
-                  WHERE organization = ? AND user_id = ? AND status = 1 AND delete_time IS NULL
-                  LIMIT 1',
-                [$peerOrganization, $toUserId],
-            );
-            if ($active === null) {
-                throw new ImException('单聊接收人无效', 'SEND_SINGLE_RECEIVER_INVALID');
-            }
-
-            return [
-                'conversation_id' => CrossOrganizationSocialPolicy::crossOrgSingleConversationId($senderId, $toUserId),
-                'peer_organization' => $peerOrganization,
-                'is_cross_organization' => true,
-            ];
         }
 
         return [
-            'conversation_id' => self::singleConversationId($organization, $senderId, $toUserId),
-            'peer_organization' => $organization,
-            'is_cross_organization' => false,
+            'conversation_id' => CrossOrganizationSocialPolicy::singleConversationId(
+                $organization,
+                $senderId,
+                $toOrganization,
+                $toUserId,
+            ),
+            'peer_organization' => $toOrganization,
+            'is_cross_organization' => $toOrganization !== $organization,
         ];
     }
 
@@ -1741,7 +2529,7 @@ final class MessageService
                FROM im_conversation_member cm
                INNER JOIN im_user u
                   ON u.user_id = cm.user_id
-                 AND u.organization IN (0, cm.organization)
+                 AND u.organization = cm.member_organization
                  AND u.is_system = 1
                  AND u.delete_time IS NULL
               WHERE cm.organization = ?
@@ -1766,7 +2554,7 @@ final class MessageService
         $placeholders = implode(',', array_fill(0, count($userIds), '?'));
         $rows = $this->repository->fetchAll(
             'SELECT user_id FROM im_user
-              WHERE organization IN (0, ?) AND user_id IN (' . $placeholders . ') AND is_system = 1 AND delete_time IS NULL',
+              WHERE organization = ? AND user_id IN (' . $placeholders . ') AND is_system = 1 AND delete_time IS NULL',
             array_merge([$organization], $userIds),
         );
 
@@ -1775,8 +2563,30 @@ final class MessageService
 
     private function conversationMembers(int $organization, string $conversationId): array
     {
+        $conversation = $this->repository->fetchOne(
+            'SELECT conversation_type FROM im_conversation
+              WHERE organization = ? AND conversation_id = ? LIMIT 1',
+            [$organization, $conversationId],
+        );
+        $identities = $this->conversationMemberIdentities($organization, $conversationId);
+
+        return array_values(array_map(
+            static fn (array $identity): string => (string) $identity['user_id'],
+            $this->homeRecipientIdentities(
+                $organization,
+                (int) ($conversation['conversation_type'] ?? 0),
+                $identities,
+            ),
+        ));
+    }
+
+    /**
+     * @return list<array{organization:int,user_id:string}>
+     */
+    private function conversationMemberIdentities(int $organization, string $conversationId): array
+    {
         $rows = $this->repository->fetchAll(
-            'SELECT cm.user_id
+            'SELECT cm.member_organization, cm.user_id
                FROM im_conversation_member cm
               WHERE cm.organization = ?
                 AND cm.conversation_id = ?
@@ -1784,22 +2594,29 @@ final class MessageService
                 AND cm.delete_time IS NULL
                 AND EXISTS (
                     SELECT 1 FROM im_user u
-                     WHERE u.user_id = cm.user_id
+                     WHERE u.organization = cm.member_organization
+                       AND u.user_id = cm.user_id
                        AND u.status = 1
                        AND u.delete_time IS NULL
                 )',
             [$organization, $conversationId],
         );
 
-        return array_values(array_map(static fn (array $row): string => (string) $row['user_id'], $rows));
+        return array_values(array_map(
+            static fn (array $row): array => [
+                'organization' => (int) $row['member_organization'],
+                'user_id' => (string) $row['user_id'],
+            ],
+            $rows,
+        ));
     }
 
-    private function findVisibleMessage(AuthContext $context, string $messageId, bool $forUpdate = false): array
+    private function findVisibleMessage(AuthContext $context, string $messageId): array
     {
         $index = $this->repository->fetchOne(
             'SELECT shard_table, global_seq FROM im_message_index
               WHERE organization = ? AND message_id = ?
-              LIMIT 1' . ($forUpdate ? ' FOR UPDATE' : ''),
+              LIMIT 1',
             [$context->organization, $messageId],
         );
         if ($index === null) {
@@ -1817,6 +2634,7 @@ final class MessageService
               INNER JOIN im_conversation_member cm
                 ON cm.organization = m.organization
                AND cm.conversation_id = m.conversation_id
+               AND cm.member_organization = ?
                AND cm.user_id = ?
                AND cm.status = 1
                AND cm.delete_time IS NULL
@@ -1826,6 +2644,7 @@ final class MessageService
                       FROM im_conversation_membership_period mp
                      WHERE mp.organization = m.organization
                        AND mp.conversation_id = m.conversation_id
+                       AND mp.member_organization = ?
                        AND mp.user_id = ?
                        AND mp.status = 1
                        AND m.message_seq >= mp.visible_from_message_seq
@@ -1835,25 +2654,200 @@ final class MessageService
                     SELECT 1 FROM im_message_user_delete ud
                      WHERE ud.organization = m.organization
                        AND ud.message_id = m.message_id
+                       AND ud.user_organization = ?
                        AND ud.user_id = ?
                 )
               LIMIT 1',
-            [$context->userId, $context->organization, $messageId, $context->userId, $context->userId],
+            [
+                $context->organization,
+                $context->userId,
+                $context->organization,
+                $messageId,
+                $context->organization,
+                $context->userId,
+                $context->organization,
+                $context->userId,
+            ],
         );
         if ($message !== null) {
             $message['_message_table'] = $table;
             $message['global_seq'] = (string) $index['global_seq'];
+            $this->conversationAccess->assertAccessible(
+                $context->organization,
+                (string) $message['conversation_id'],
+            );
             return $message;
         }
 
         throw new ImException('消息不存在或无权访问', 'MESSAGE_NOT_FOUND');
     }
 
+    /**
+     * @param list<int> $homeOrganizations
+     * @return array<int,array<string,mixed>>
+     */
+    private function messageHomeProjections(array $message, array $homeOrganizations): array
+    {
+        $conversationId = (string) $message['conversation_id'];
+        $messageId = (string) $message['message_id'];
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if ($homeOrganizations === []) {
+            throw new ImException('消息home投影范围为空', 'MESSAGE_HOME_PROJECTION_MISSING');
+        }
+        $projections = [];
+        foreach ($homeOrganizations as $homeOrganization) {
+            $index = $this->repository->fetchOne(
+                'SELECT shard_table, global_seq
+                   FROM im_message_index
+                  WHERE organization = ? AND message_id = ?
+                  LIMIT 1 FOR UPDATE',
+                [$homeOrganization, $messageId],
+            );
+            if ($index === null) {
+                throw new ImException('消息home索引缺失', 'MESSAGE_HOME_INDEX_MISSING');
+            }
+            $table = (string) $index['shard_table'];
+            $homeMessage = $this->repository->fetchOne(
+                'SELECT * FROM ' . $this->messageShardRouter->quote($table) . '
+                  WHERE organization = ? AND message_id = ?
+                  LIMIT 1 FOR UPDATE',
+                [$homeOrganization, $messageId],
+            );
+            if ($homeMessage === null) {
+                throw new ImException('消息home主体缺失', 'MESSAGE_HOME_BODY_MISSING');
+            }
+            $homeMessage['_message_table'] = $table;
+            $homeMessage['global_seq'] = (string) $index['global_seq'];
+            $projections[$homeOrganization] = $homeMessage;
+        }
+
+        return $projections;
+    }
+
+    /**
+     * @return array{0:array{organization:int,user_id:string},1:array{organization:int,user_id:string}}
+     */
+    private function orderedIdentityPair(
+        int $leftOrganization,
+        string $leftUserId,
+        int $rightOrganization,
+        string $rightUserId,
+    ): array {
+        $identities = [
+            [
+                'key' => $leftOrganization . ':' . $leftUserId,
+                'organization' => $leftOrganization,
+                'user_id' => $leftUserId,
+            ],
+            [
+                'key' => $rightOrganization . ':' . $rightUserId,
+                'organization' => $rightOrganization,
+                'user_id' => $rightUserId,
+            ],
+        ];
+        usort(
+            $identities,
+            static fn (array $left, array $right): int => strcmp($left['key'], $right['key']),
+        );
+        unset($identities[0]['key'], $identities[1]['key']);
+
+        return [$identities[0], $identities[1]];
+    }
+
+    /**
+     * @return array{
+     *   0:array{organization:int,user_id:string,friend_organization:int,friend_user_id:string},
+     *   1:array{organization:int,user_id:string,friend_organization:int,friend_user_id:string}
+     * }
+     */
+    private function canonicalFriendDirections(
+        int $leftOrganization,
+        string $leftUserId,
+        int $rightOrganization,
+        string $rightUserId,
+    ): array {
+        $identities = $this->orderedIdentityPair(
+            $leftOrganization,
+            $leftUserId,
+            $rightOrganization,
+            $rightUserId,
+        );
+
+        return [
+            [
+                'organization' => $identities[0]['organization'],
+                'user_id' => $identities[0]['user_id'],
+                'friend_organization' => $identities[1]['organization'],
+                'friend_user_id' => $identities[1]['user_id'],
+            ],
+            [
+                'organization' => $identities[1]['organization'],
+                'user_id' => $identities[1]['user_id'],
+                'friend_organization' => $identities[0]['organization'],
+                'friend_user_id' => $identities[0]['user_id'],
+            ],
+        ];
+    }
+
+    /** @param array{organization:int,user_id:string} $identity */
+    private function sameIdentity(array $identity, int $organization, string $userId): bool
+    {
+        return (int) $identity['organization'] === $organization
+            && (string) $identity['user_id'] === $userId;
+    }
+
+    /** @param list<array{organization:int,user_id:string}> $identities */
+    private function homeRecipientIdentities(int $homeOrganization, int $conversationType, array $identities): array
+    {
+        if ($conversationType === self::CONVERSATION_GROUP) {
+            foreach ($identities as $identity) {
+                if ((int) ($identity['organization'] ?? 0) !== $homeOrganization) {
+                    throw new ImException('群聊不允许包含外机构成员', 'GROUP_MEMBER_ORGANIZATION_FORBIDDEN');
+                }
+            }
+        }
+
+        return array_values(array_filter(
+            $identities,
+            static fn (array $identity): bool => (int) ($identity['organization'] ?? 0) === $homeOrganization,
+        ));
+    }
+
+    private function requireOperationClientMsgId(array $data, string $operation): string
+    {
+        $clientMsgId = trim((string) ($data['client_msg_id'] ?? ''));
+        if ($clientMsgId === '' || strlen($clientMsgId) > 80 || str_contains($clientMsgId, "\0")) {
+            throw new ImException('缺少或无效的 client_msg_id', $operation . '_CLIENT_MSG_ID_INVALID');
+        }
+
+        return $clientMsgId;
+    }
+
+    /** @return array{client_msg_id:string,request_client_msg_id:string,actor_organization:int,actor_user_id:string} */
+    private function requestBinding(AuthContext $context, string $clientMsgId): array
+    {
+        return [
+            'client_msg_id' => $clientMsgId,
+            'request_client_msg_id' => $clientMsgId,
+            'actor_organization' => $context->organization,
+            'actor_user_id' => $context->userId,
+        ];
+    }
+
+    private function screenshotSystemClientMsgId(AuthContext $context, string $clientMsgId): string
+    {
+        return 'screenshot_' . hash(
+            'sha256',
+            $context->organization . ':' . $context->userId . ':' . $clientMsgId,
+        );
+    }
+
     private function normalizeConversationType(array $data): int
     {
         $value = $data['conversation_type'] ?? null;
         if ($value === null) {
-            return (isset($data['to_user_id']) || isset($data['receiver_id'])) ? self::CONVERSATION_SINGLE : self::CONVERSATION_GROUP;
+            return isset($data['to_user_id']) ? self::CONVERSATION_SINGLE : self::CONVERSATION_GROUP;
         }
         if (is_string($value)) {
             return match (strtolower($value)) {
@@ -1914,7 +2908,7 @@ final class MessageService
             return false;
         }
 
-        return str_contains((string) ($exception->errorInfo[2] ?? $exception->getMessage()), 'uni_organization_client_msg');
+        return str_contains((string) ($exception->errorInfo[2] ?? $exception->getMessage()), 'uni_home_sender_client_msg');
     }
 
     private function normalizeContent(AuthContext $context, int $messageType, mixed $content): array
@@ -2002,81 +2996,150 @@ final class MessageService
         AuthContext $context,
         string $conversationId,
         int $conversationType,
+        array $homeOrganizations,
+        ?string $crossOrgAccessSnapshotId,
         string $event,
         array $extra = [],
+        ?string $idempotencyClientMsgId = null,
     ): array {
-        $messageSeq = $this->allocateMessageSeq($context->organization, $conversationId);
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if ($homeOrganizations === [] || !in_array($context->organization, $homeOrganizations, true)) {
+            throw new ImException('系统通知home边界无效', 'SYSTEM_NOTICE_HOME_BOUNDARY_INVALID');
+        }
+        if ($idempotencyClientMsgId !== null) {
+            $existing = $this->findMessageByClientMsg(
+                $context->organization,
+                $context->organization,
+                self::SYSTEM_NOTIFICATION_USER_ID,
+                $idempotencyClientMsgId,
+            );
+            if ($existing !== null) {
+                if ((string) $existing['conversation_id'] !== $conversationId) {
+                    throw new ImException('操作幂等键已绑定其他会话', 'OPERATION_IDEMPOTENCY_CONFLICT');
+                }
+                $state = $this->repository->fetchOne(
+                    'SELECT last_message_id, last_message_seq, last_message_time, last_message_summary
+                       FROM im_conversation
+                      WHERE organization = ? AND conversation_id = ? LIMIT 1',
+                    [$context->organization, $conversationId],
+                ) ?? [];
+
+                return ['message' => $this->formatMessage($existing), ...$state];
+            }
+        }
+        $messageSeq = $this->allocateMessageSeq($conversationId, $homeOrganizations);
         $messageId = $this->newMessageId();
         $now = $this->now();
-        $messageTable = $this->messageShardRouter->writeTable($context->organization, $conversationId, $now);
-        $actor = $this->formatMessageSender($context->organization, $context->userId);
+        $actor = $this->formatMessageSender(
+            $context->organization,
+            $context->organization,
+            $context->userId,
+        );
         $actorName = trim((string) ($actor['nickname'] ?? $actor['account'] ?? ''));
         $content = [
             'event' => $event,
             'text' => $event === self::NOTICE_RECALL ? '消息已撤回' : '截屏提示',
             'actor_user_id' => $context->userId,
+            'actor_organization' => $context->organization,
             'actor_name' => $actorName !== '' ? $actorName : $context->userId,
             'conversation_type' => $conversationType,
             ...$extra,
         ];
-
-        $this->repository->execute(
-            'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
-                (organization, conversation_id, conversation_type, message_id, message_seq, client_msg_id, sender_id, message_type, content, status, create_time, update_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [
-                $context->organization,
-                $conversationId,
-                $conversationType,
-                $messageId,
-                $messageSeq,
-                'system-' . $messageId,
-                self::SYSTEM_NOTIFICATION_USER_ID,
-                MessageType::SYSTEM,
-                json_encode($content, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-                self::MESSAGE_NORMAL,
-                $now,
-                $now,
-            ],
-        );
-
-        $message = $this->repository->fetchOne(
-            'SELECT * FROM ' . $this->messageShardRouter->quote($messageTable) . ' WHERE organization = ? AND message_id = ? LIMIT 1',
-            [$context->organization, $messageId],
-        );
-        if ($message === null) {
-            throw new ImException('系统提示写入失败', 'SYSTEM_NOTICE_CREATE_FAILED');
+        $systemClientMsgId = $idempotencyClientMsgId ?? ('system-' . $messageId);
+        $contentJson = json_encode($content, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        $homeMessages = [];
+        $originState = [];
+        foreach ($homeOrganizations as $homeOrganization) {
+            $messageTable = $this->messageShardRouter->writeTable($homeOrganization, $conversationId, $now);
+            $this->repository->execute(
+                'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
+                    (organization, conversation_id, conversation_type, message_id, message_seq,
+                     client_msg_id, sender_id, sender_organization, message_type, content,
+                     status, create_time, update_time)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [
+                    $homeOrganization,
+                    $conversationId,
+                    $conversationType,
+                    $messageId,
+                    $messageSeq,
+                    $systemClientMsgId,
+                    self::SYSTEM_NOTIFICATION_USER_ID,
+                    $homeOrganization,
+                    MessageType::SYSTEM,
+                    $contentJson,
+                    self::MESSAGE_NORMAL,
+                    $now,
+                    $now,
+                ],
+            );
+            $message = $this->repository->fetchOne(
+                'SELECT * FROM ' . $this->messageShardRouter->quote($messageTable)
+                . ' WHERE organization = ? AND message_id = ? LIMIT 1',
+                [$homeOrganization, $messageId],
+            );
+            if ($message === null) {
+                throw new ImException('系统提示写入失败', 'SYSTEM_NOTICE_CREATE_FAILED');
+            }
+            $message['_message_table'] = $messageTable;
+            $globalSeq = $this->allocateGlobalSeq($homeOrganization);
+            $this->createMessageIndex(
+                organization: $homeOrganization,
+                conversationId: $conversationId,
+                messageId: $messageId,
+                messageSeq: $messageSeq,
+                globalSeq: $globalSeq,
+                senderOrganization: $homeOrganization,
+                senderId: self::SYSTEM_NOTIFICATION_USER_ID,
+                clientMsgId: $systemClientMsgId,
+                messageTable: $messageTable,
+                now: $now,
+            );
+            $message['global_seq'] = (string) $globalSeq;
+            $recipientIdentities = array_values(array_filter(
+                $this->homeRecipientIdentities(
+                    $homeOrganization,
+                    $conversationType,
+                    $this->conversationMemberIdentities($homeOrganization, $conversationId),
+                ),
+                fn (array $identity): bool => !$this->sameIdentity(
+                    $identity,
+                    $context->organization,
+                    $context->userId,
+                ),
+            ));
+            foreach ($recipientIdentities as $identity) {
+                $this->upsertReceipt(
+                    $homeOrganization,
+                    $conversationId,
+                    $messageId,
+                    (int) $identity['organization'],
+                    (string) $identity['user_id'],
+                    self::RECEIPT_SENT,
+                    null,
+                    null,
+                );
+            }
+            $this->increaseUnread($homeOrganization, $conversationId, $recipientIdentities);
+            $formattedMessage = $this->formatMessage($message);
+            $homeMessages[$homeOrganization] = $formattedMessage;
+            $this->outbox->createMessageCreated(
+                context: $context,
+                homeOrganization: $homeOrganization,
+                message: $formattedMessage,
+                recipientIdentities: $recipientIdentities,
+                crossOrgAccessSnapshotId: $crossOrgAccessSnapshotId,
+            );
+            $state = $this->refreshConversationLastMessage($homeOrganization, $conversationId, $now);
+            if ($homeOrganization === $context->organization) {
+                $originState = $state;
+            }
         }
-        $message['_message_table'] = $messageTable;
-        $globalSeq = $this->allocateGlobalSeq($context->organization);
-        $systemClientMsgId = 'system-' . $messageId;
-        $this->createMessageIndex(
-            organization: $context->organization,
-            conversationId: $conversationId,
-            messageId: $messageId,
-            messageSeq: $messageSeq,
-            globalSeq: $globalSeq,
-            senderId: self::SYSTEM_NOTIFICATION_USER_ID,
-            clientMsgId: $systemClientMsgId,
-            messageTable: $messageTable,
-            now: $now,
-        );
-        $message['global_seq'] = (string) $globalSeq;
-
-        $recipientUserIds = array_values(array_filter(
-            $this->conversationMembers($context->organization, $conversationId),
-            static fn (string $userId): bool => $userId !== $context->userId,
-        ));
-        $this->createReceipts($context, $conversationId, $messageId, $recipientUserIds);
-        $this->increaseUnread($context->organization, $conversationId, $recipientUserIds);
-        $formattedMessage = $this->formatMessage($message);
-        $this->outbox->createMessageCreated($context, $formattedMessage, $recipientUserIds);
-
-        $conversationState = $this->refreshConversationLastMessage($context->organization, $conversationId, $now);
 
         return [
-            'message' => $formattedMessage,
-            ...$conversationState,
+            'message' => $homeMessages[$context->organization],
+            ...$originState,
         ];
     }
 
@@ -2147,6 +3210,7 @@ final class MessageService
     {
         $content = json_decode((string) ($message['content'] ?? '{}'), true);
         $senderId = (string) $message['sender_id'];
+        $senderOrganization = (int) $message['sender_organization'];
         $status = match ((int) $message['status']) {
             self::MESSAGE_NORMAL => 'normal',
             self::MESSAGE_RECALLED => 'recalled',
@@ -2166,7 +3230,12 @@ final class MessageService
             )),
             'client_msg_id' => (string) $message['client_msg_id'],
             'sender_id' => $senderId,
-            'sender_user' => $this->formatMessageSender((int) $message['organization'], $senderId),
+            'sender_organization' => $senderOrganization,
+            'sender_user' => $this->formatMessageSender(
+                (int) $message['organization'],
+                $senderOrganization,
+                $senderId,
+            ),
             'message_type' => (int) $message['message_type'],
             'content' => $status === 'normal' && is_array($content) ? $content : null,
             'status' => $status,
@@ -2177,13 +3246,46 @@ final class MessageService
         ];
     }
 
-    private function formatMessageSender(int $organization, string $senderId): ?array
+    private function formatMessageSender(
+        int $homeOrganization,
+        int $senderOrganization,
+        string $senderId,
+    ): ?array
     {
         if ($senderId === '') {
             return null;
         }
+        if ($senderId === self::SYSTEM_NOTIFICATION_USER_ID) {
+            if ($senderOrganization !== $homeOrganization || $senderOrganization <= 0) {
+                throw new ImException('系统通知身份与消息home不一致', 'IM_SYSTEM_IDENTITY_INVALID');
+            }
 
-        // Prefer same-org / platform system user; fall back to any-org peer for dual-home cross-org messages.
+            return [
+                'id' => '',
+                'user_id' => self::SYSTEM_NOTIFICATION_USER_ID,
+                'account' => self::SYSTEM_NOTIFICATION_USER_ID,
+                'nickname' => '系统通知',
+                'display_name' => '系统通知',
+                'organization' => $senderOrganization,
+                'organization_name' => '',
+                'company_name' => '',
+                'is_cross_organization' => false,
+                'signature' => '',
+                'avatar_file_id' => '',
+                'avatar_url' => '',
+                'avatar_expires_at' => 0,
+                'mobile' => '',
+                'im_short_no' => '',
+                'gender' => 0,
+                'status' => 1,
+                'status_text' => '正常',
+                'remark' => '',
+                'login_time' => '',
+                'is_system' => true,
+                'system_code' => self::SYSTEM_NOTIFICATION_USER_ID,
+            ];
+        }
+
         $row = $this->repository->fetchOne(
             'SELECT u.id, u.organization, u.user_id, u.account, u.nickname, p.signature, u.avatar, u.mobile,
                     u.im_short_no, u.gender, u.status, u.remark, u.login_time, u.is_system, u.system_code,
@@ -2197,21 +3299,11 @@ final class MessageService
                LEFT JOIN sm_system_organization org
                  ON org.id = u.organization
                 AND org.delete_time IS NULL
-              WHERE u.user_id = ?
+              WHERE u.organization = ?
+                AND u.user_id = ?
                 AND u.delete_time IS NULL
-                AND (
-                    (u.organization = ? AND u.is_system = 2)
-                    OR (u.organization = 0 AND u.is_system = 1)
-                    OR (u.is_system = 2 AND u.status = 1)
-                )
-           ORDER BY CASE
-                        WHEN u.organization = ? AND u.is_system = 2 THEN 0
-                        WHEN u.organization = 0 AND u.is_system = 1 THEN 1
-                        ELSE 2
-                    END,
-                    u.id ASC
               LIMIT 1',
-            [$senderId, $organization, $organization],
+            [$senderOrganization, $senderId],
         );
         if ($row === null) {
             return null;
@@ -2226,8 +3318,8 @@ final class MessageService
         $senderOrganization = (int) ($row['organization'] ?? 0);
         $companyName = trim((string) ($row['organization_name'] ?? ''));
         $isCrossOrg = $senderOrganization > 0
-            && $organization > 0
-            && $senderOrganization !== $organization
+            && $homeOrganization > 0
+            && $senderOrganization !== $homeOrganization
             && (int) ($row['is_system'] ?? 2) === 2;
         $nickname = (string) ($row['nickname'] ?? '');
         $account = (string) ($row['account'] ?? '');
@@ -2275,6 +3367,160 @@ final class MessageService
     private function newMessageId(): string
     {
         return date('YmdHis') . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT) . substr(bin2hex(random_bytes(4)), 0, 8);
+    }
+
+    /**
+     * Every existing cross-home durable write uses the same prefix:
+     * global social policy -> numeric organizations -> both tenant policies.
+     * Canonical, home and message locks are acquired only after this returns.
+     *
+     * @param list<int> $homeOrganizations
+     * @return array<int,TenantImPolicySnapshot>
+     */
+    private function lockCrossHomeTenantPolicyBoundary(array $homeOrganizations): array
+    {
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if (count($homeOrganizations) !== 2) {
+            return [];
+        }
+
+        $this->conversationAccess->lockCrossOrganizationWriteBoundary($homeOrganizations);
+
+        return $this->lockHomeTenantPolicies($homeOrganizations);
+    }
+
+    /**
+     * Cross-home durable mutations must use one locked policy snapshot for
+     * every participating home. Reading through the per-home Redis cache here
+     * could combine policy versions or keep a peer-side disable invisible.
+     *
+     * @param list<int> $homeOrganizations
+     * @return array<int,TenantImPolicySnapshot>
+     */
+    private function lockHomeTenantPolicies(array $homeOrganizations): array
+    {
+        return $this->conversationAccess->lockHomeTenantPolicies($homeOrganizations);
+    }
+
+    /**
+     * @param list<int> $homeOrganizations
+     * @return array<int,array<string,string>>
+     */
+    private function lockHomeMessageOperationConfigs(array $homeOrganizations): array
+    {
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if (count($homeOrganizations) !== 2) {
+            throw new ImException('跨机构消息操作策略边界无效', 'MESSAGE_OPERATION_POLICY_INVALID');
+        }
+
+        $group = $this->repository->fetchOne(
+            'SELECT id
+               FROM sm_system_config_group
+              WHERE code = ? AND delete_time IS NULL
+              LIMIT 1 LOCK IN SHARE MODE',
+            ['message_config'],
+        );
+        if ($group === null) {
+            throw new ImException('消息操作策略缺失', 'MESSAGE_OPERATION_POLICY_INVALID');
+        }
+        $groupId = (int) $group['id'];
+        $base = [];
+        $rows = $this->repository->fetchAll(
+            'SELECT `key`, `value`
+               FROM sm_system_config
+              WHERE group_id = ? AND delete_time IS NULL
+              ORDER BY `key`
+              LOCK IN SHARE MODE',
+            [$groupId],
+        );
+        foreach ($rows as $row) {
+            $base[(string) $row['key']] = (string) ($row['value'] ?? '');
+        }
+
+        $configs = [];
+        foreach ($homeOrganizations as $homeOrganization) {
+            $config = $base;
+            $tenant = $this->repository->fetchOne(
+                'SELECT `value`
+                   FROM sm_tenant_config
+                  WHERE organization = ? AND group_id = ? AND delete_time IS NULL
+                  LIMIT 1 LOCK IN SHARE MODE',
+                [$homeOrganization, $groupId],
+            );
+            if ($tenant !== null) {
+                try {
+                    $tenantValue = json_decode(
+                        (string) ($tenant['value'] ?? ''),
+                        true,
+                        flags: JSON_THROW_ON_ERROR,
+                    );
+                } catch (\JsonException) {
+                    throw new ImException('参与机构消息操作策略无效', 'MESSAGE_OPERATION_POLICY_INVALID');
+                }
+                if (!is_array($tenantValue)) {
+                    throw new ImException('参与机构消息操作策略无效', 'MESSAGE_OPERATION_POLICY_INVALID');
+                }
+                foreach ($tenantValue as $tenantKey => $tenantItemValue) {
+                    if ($tenantItemValue !== '' && $tenantItemValue !== null) {
+                        $config[(string) $tenantKey] = (string) $tenantItemValue;
+                    }
+                }
+            }
+            $configs[$homeOrganization] = $config;
+        }
+
+        return $configs;
+    }
+
+    /** @param array<int,TenantImPolicySnapshot> $policies */
+    private function recallNoticeRequiredByAnyHome(array $policies, int $conversationType): bool
+    {
+        foreach ($policies as $policy) {
+            if (
+                $policy->recallNoticeEnabled
+                && (
+                    $conversationType !== self::CONVERSATION_GROUP
+                    || $policy->groupRecallNoticeEnabled
+                )
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @param array<int,array<string,string>> $configs */
+    private function messageNoticeRequiredByAnyHome(
+        array $configs,
+        string $event,
+        int $conversationType,
+    ): bool {
+        $scope = $conversationType === self::CONVERSATION_GROUP ? 'group' : 'single';
+        $key = 'message_' . $event . '_notice_' . $scope . '_enabled';
+        foreach ($configs as $config) {
+            if ((string) ($config[$key] ?? '1') === '1') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @param array<int,array<string,string>> $configs */
+    private function messageDeleteEnabledForEveryHome(array $configs, string $scope): bool
+    {
+        $key = $scope === 'both' ? 'message_delete_both_enabled' : 'message_delete_single_enabled';
+        $default = $scope === 'both' ? '2' : '1';
+        foreach ($configs as $config) {
+            if ((string) ($config[$key] ?? $default) !== '1') {
+                return false;
+            }
+        }
+
+        return $configs !== [];
     }
 
     private function messageNoticeEnabled(int $organization, string $event, int $conversationType): bool
@@ -2347,100 +3593,4 @@ final class MessageService
         return $config;
     }
 
-    /**
-     * Dual-home message for recipient org so SYNC/history works for the peer.
-     *
-     * @param list<string> $recipientUserIds
-     */
-    private function mirrorCrossOrgMessage(
-        int $senderOrganization,
-        int $peerOrganization,
-        string $conversationId,
-        int $conversationType,
-        string $messageId,
-        int $messageSeq,
-        string $clientMsgId,
-        string $senderId,
-        int $messageType,
-        string $contentJson,
-        string $summary,
-        string $now,
-        array $recipientUserIds,
-    ): void {
-        if ($peerOrganization <= 0 || $peerOrganization === $senderOrganization) {
-            return;
-        }
-        $this->ensureOrganizationSequence($peerOrganization);
-        // Align peer conversation sequence cursor.
-        $this->repository->execute(
-            'UPDATE im_conversation
-                SET next_message_seq = GREATEST(next_message_seq, ?),
-                    last_message_id = ?,
-                    last_message_seq = ?,
-                    last_message_time = ?,
-                    last_message_summary = ?,
-                    update_time = ?
-              WHERE organization = ? AND conversation_id = ?',
-            [$messageSeq + 1, $messageId, $messageSeq, $now, $summary, $now, $peerOrganization, $conversationId],
-        );
-        $messageTable = $this->messageShardRouter->writeTable($peerOrganization, $conversationId, $now);
-        $exists = $this->repository->fetchOne(
-            'SELECT message_id FROM ' . $this->messageShardRouter->quote($messageTable) . '
-              WHERE organization = ? AND message_id = ? LIMIT 1',
-            [$peerOrganization, $messageId],
-        );
-        if ($exists === null) {
-            $this->repository->execute(
-                'INSERT INTO ' . $this->messageShardRouter->quote($messageTable) . '
-                    (organization, conversation_id, conversation_type, message_id, message_seq, client_msg_id,
-                     sender_id, message_type, content, status, create_time, update_time)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [
-                    $peerOrganization,
-                    $conversationId,
-                    $conversationType,
-                    $messageId,
-                    $messageSeq,
-                    $clientMsgId,
-                    $senderId,
-                    $messageType,
-                    $contentJson,
-                    self::MESSAGE_NORMAL,
-                    $now,
-                    $now,
-                ],
-            );
-        }
-        $index = $this->repository->fetchOne(
-            'SELECT message_id FROM im_message_index
-              WHERE organization = ? AND message_id = ? LIMIT 1',
-            [$peerOrganization, $messageId],
-        );
-        if ($index === null) {
-            $globalSeq = $this->allocateGlobalSeq($peerOrganization);
-            $this->createMessageIndex(
-                organization: $peerOrganization,
-                conversationId: $conversationId,
-                messageId: $messageId,
-                messageSeq: $messageSeq,
-                globalSeq: $globalSeq,
-                senderId: $senderId,
-                clientMsgId: $clientMsgId,
-                messageTable: $messageTable,
-                now: $now,
-            );
-        }
-        foreach ($recipientUserIds as $userId) {
-            $this->upsertReceipt($peerOrganization, $conversationId, $messageId, $userId, self::RECEIPT_SENT, null, null);
-        }
-        $this->increaseUnread($peerOrganization, $conversationId, $recipientUserIds);
-    }
-
-    private static function singleConversationId(int $organization, string $left, string $right): string
-    {
-        $pair = [$left, $right];
-        sort($pair, SORT_STRING);
-
-        return 'single_' . substr(sha1($organization . ':' . implode(':', $pair)), 0, 40);
-    }
 }

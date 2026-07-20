@@ -242,6 +242,7 @@ class Events
                 'audience' => $context->audience,
                 'not_before' => $context->notBefore,
                 'expire_at' => $context->expireAt,
+                'cross_org_access_snapshot_id' => Runtime::crossOrgSocial()->snapshotId(true),
             ], $context->organization)->encode()
         );
     }
@@ -255,6 +256,7 @@ class Events
 
     private static function handleSend(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'SEND');
         $context = self::requireContext($clientId);
         $permit = Telemetry::run(
             'im.send.tenant_policy',
@@ -272,7 +274,7 @@ class Events
                 attributes: [
                     'operation' => 'im.send',
                     'b8im.organization' => $context->organization,
-                    'b8im.client_msg_id' => (string) ($packet->clientMsgId ?? ''),
+                    'b8im.client_msg_id' => $clientMsgId,
                 ],
             );
         } finally {
@@ -298,65 +300,92 @@ class Events
                 'global_seq' => $result['message']['global_seq'],
                 'client_msg_id' => $result['message']['client_msg_id'],
                 'message' => $result['message'],
-            ], $context->organization, $packet->clientMsgId)->encode()
+            ], $context->organization, $clientMsgId)->encode()
         );
     }
 
     private static function handleAck(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'ACK');
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->ack($context, $packet->data);
+        $result = Runtime::messages()->ack($context, self::requestData($packet, $clientMsgId));
         Gateway::sendToClient(
             $clientId,
             self::responsePacket(
                 Command::ACK_ACK,
                 $result,
                 $context->organization,
-                $packet->clientMsgId,
+                $clientMsgId,
             )->encode(),
         );
 
-        if ((string) $result['sender_id'] !== $context->userId) {
-            Gateway::sendToUid(
-                AuthContext::uidFor($context->organization, (string) $result['sender_id']),
-                self::responsePacket(Command::ACK, $result, $context->organization)->encode()
-            );
-        }
     }
 
     private static function handleRecall(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'RECALL');
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->recall($context, $packet->data);
-        Gateway::sendToClient($clientId, self::responsePacket(Command::RECALL_ACK, $result, $context->organization)->encode());
+        $result = Runtime::messages()->recall($context, self::requestData($packet, $clientMsgId));
+        Gateway::sendToClient($clientId, self::responsePacket(
+            Command::RECALL_ACK,
+            $result,
+            $context->organization,
+            $clientMsgId,
+        )->encode());
     }
 
     private static function handleEdit(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'EDIT');
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->edit($context, $packet->data);
-        Gateway::sendToClient($clientId, self::responsePacket(Command::EDIT_ACK, $result, $context->organization)->encode());
+        $result = Runtime::messages()->edit($context, self::requestData($packet, $clientMsgId));
+        Gateway::sendToClient($clientId, self::responsePacket(
+            Command::EDIT_ACK,
+            $result,
+            $context->organization,
+            $clientMsgId,
+        )->encode());
     }
 
     private static function handleDelete(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'DELETE');
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->delete($context, $packet->data);
-        Gateway::sendToClient($clientId, self::responsePacket(Command::DELETE_ACK, $result, $context->organization)->encode());
+        $result = Runtime::messages()->delete($context, self::requestData($packet, $clientMsgId));
+        Gateway::sendToClient($clientId, self::responsePacket(
+            Command::DELETE_ACK,
+            $result,
+            $context->organization,
+            $clientMsgId,
+        )->encode());
     }
 
     private static function handleScreenshot(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'SCREENSHOT');
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->screenshot($context, $packet->data);
-        Gateway::sendToClient($clientId, self::responsePacket(Command::SCREENSHOT_ACK, $result, $context->organization)->encode());
+        $result = Runtime::messages()->screenshot($context, self::requestData($packet, $clientMsgId));
+        Gateway::sendToClient($clientId, self::responsePacket(
+            Command::SCREENSHOT_ACK,
+            $result,
+            $context->organization,
+            $clientMsgId,
+        )->encode());
     }
 
     private static function handleSync(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'SYNC');
         $context = self::requireContext($clientId);
-        $result = Runtime::messages()->sync($context, $packet->data);
-        Gateway::sendToClient($clientId, self::responsePacket(Command::SYNC_ACK, $result, $context->organization)->encode());
+        $data = $packet->data;
+        unset($data['client_msg_id']);
+        $result = Runtime::messages()->sync($context, $data);
+        Gateway::sendToClient($clientId, self::responsePacket(
+            Command::SYNC_ACK,
+            $result,
+            $context->organization,
+            $clientMsgId,
+        )->encode());
     }
 
     private static function handleTyping(string $clientId, Packet $packet): void
@@ -383,6 +412,7 @@ class Events
 
     private static function handleConversationRead(string $clientId, Packet $packet): void
     {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'CONVERSATION_READ');
         $context = self::requireContext($clientId);
         $conversationId = trim((string) ($packet->data['conversation_id'] ?? ''));
         $lastReadMessageId = trim((string) ($packet->data['last_read_message_id'] ?? ''));
@@ -394,7 +424,7 @@ class Events
                 Command::CONVERSATION_READ_ACK,
                 $result,
                 $context->organization,
-                $packet->clientMsgId,
+                $clientMsgId,
             )->encode()
         );
     }
@@ -485,5 +515,33 @@ class Events
             $clientMsgId,
             Telemetry::currentTraceContext(),
         );
+    }
+
+    /** @return array<string,mixed> */
+    private static function requestData(Packet $packet, string $clientMsgId): array
+    {
+        $data = $packet->data;
+        unset($data['client_msg_id']);
+
+        return [...$data, 'client_msg_id' => $clientMsgId];
+    }
+
+    private static function requireTopLevelClientMsgId(Packet $packet, string $operation): string
+    {
+        $clientMsgId = $packet->clientMsgId;
+        if (
+            $clientMsgId === null
+            || $clientMsgId === ''
+            || trim($clientMsgId) !== $clientMsgId
+            || strlen($clientMsgId) > 80
+            || str_contains($clientMsgId, "\0")
+        ) {
+            throw new ImException(
+                '缺少或无效的顶层 client_msg_id',
+                $operation . '_CLIENT_MSG_ID_INVALID',
+            );
+        }
+
+        return $clientMsgId;
     }
 }

@@ -11,9 +11,6 @@ namespace B8im\ImBusiness\Service;
 use B8im\ImBusiness\Auth\AuthContext;
 use B8im\ImBusiness\Exception\ImException;
 use B8im\ImBusiness\Repository\ImRepository;
-use B8im\ImShared\Protocol\Command;
-use B8im\ImShared\Protocol\Packet;
-use GatewayWorker\Lib\Gateway;
 
 /**
  * 会话读状态同步
@@ -25,9 +22,17 @@ use GatewayWorker\Lib\Gateway;
  */
 final class ConversationSyncService
 {
+    private readonly CrossOrganizationConversationAccess $conversationAccess;
+
     public function __construct(
         private readonly ImRepository $repository,
+        private readonly OutboxService $outbox,
+        ?CrossOrganizationConversationAccess $conversationAccess = null,
     ) {
+        $this->conversationAccess = $conversationAccess ?? new CrossOrganizationConversationAccess(
+            $repository,
+            new CrossOrganizationSocialPolicy($repository),
+        );
     }
 
     /**
@@ -50,44 +55,103 @@ final class ConversationSyncService
         if ($lastReadMessageId === '') {
             throw new ImException('缺少 last_read_message_id', 'CONVERSATION_READ_MESSAGE_ID_EMPTY');
         }
+        $accessPreview = $this->conversationAccess->assertAccessible(
+            $context->organization,
+            $conversationId,
+        );
         $this->assertActiveMember($context, $conversationId);
         $lastReadSeq = $this->visibleMessageSeq($context, $conversationId, $lastReadMessageId);
 
         $now = date('Y-m-d H:i:s');
-        $readState = $this->repository->transaction(fn (): array => $this->advanceReadState(
+        $result = $this->repository->transaction(function () use (
             $context,
             $conversationId,
             $lastReadMessageId,
             $lastReadSeq,
             $now,
-        ));
-
-        $result = [
-            'conversation_id' => $conversationId,
-            'last_read_message_id' => $readState['last_read_message_id'],
-            'last_read_seq' => $readState['last_read_seq'],
-            'unread_count' => $readState['unread_count'],
-            'user_id' => $context->userId,
-            'time' => $now,
-        ];
-
-        $payload = Packet::make(Command::CONVERSATION_READ, $result, $context->organization)->encode();
-
-        // 1. 自己其他设备：多端已读位置同步
-        $ownClientIds = Gateway::getClientIdByUid($context->uid());
-        foreach ($ownClientIds as $cid) {
-            if ($cid !== $clientId) {
-                Gateway::sendToClient($cid, $payload);
+            $accessPreview,
+        ): array {
+            if (count($accessPreview['home_organizations']) === 2) {
+                $this->conversationAccess->lockCrossOrganizationWriteBoundary(
+                    $accessPreview['home_organizations'],
+                );
+                $this->conversationAccess->lockHomeTenantPolicies(
+                    $accessPreview['home_organizations'],
+                );
             }
-        }
-
-        // 2. 会话其他成员：已读回执（对方感知"已读到哪"）
-        foreach ($this->conversationMembers($context->organization, $conversationId) as $userId) {
-            if ($userId === $context->userId) {
-                continue;
+            $access = $this->conversationAccess->assertAccessible(
+                $context->organization,
+                $conversationId,
+                true,
+                $accessPreview['home_organizations'],
+                $accessPreview['participant_identities'],
+            );
+            $homeOrganizations = $access['home_organizations'];
+            $homeReadStates = [];
+            foreach ($homeOrganizations as $homeOrganization) {
+                $homeReadStates[$homeOrganization] = $this->advanceReadState(
+                    $homeOrganization,
+                    $context->organization,
+                    $context->userId,
+                    $conversationId,
+                    $lastReadMessageId,
+                    $lastReadSeq,
+                    $now,
+                );
             }
-            Gateway::sendToUid(AuthContext::uidFor($context->organization, $userId), $payload);
-        }
+            $readState = $homeReadStates[$context->organization]
+                ?? throw new ImException('当前home读状态投影缺失', 'CONVERSATION_READ_HOME_MISSING');
+            $result = [
+                'conversation_id' => $conversationId,
+                'last_read_message_id' => $readState['last_read_message_id'],
+                'last_read_seq' => $readState['last_read_seq'],
+                'unread_count' => $readState['unread_count'],
+                'user_organization' => $context->organization,
+                'user_id' => $context->userId,
+                'time' => $now,
+                'cross_org_access_snapshot_id' => $access['access_snapshot_id'],
+            ];
+            $conversation = $this->repository->fetchOne(
+                'SELECT conversation_type FROM im_conversation
+                  WHERE organization = ? AND conversation_id = ? AND status = 1
+                  LIMIT 1',
+                [$context->organization, $conversationId],
+            );
+            if ($conversation === null) {
+                throw new ImException('会话不存在或无权访问', 'CONVERSATION_READ_MEMBER_NOT_FOUND');
+            }
+            foreach ($homeOrganizations as $homeOrganization) {
+                $allRecipientIdentities = $this->conversationMemberIdentities($homeOrganization, $conversationId);
+                if ((int) $conversation['conversation_type'] === 2) {
+                    foreach ($allRecipientIdentities as $identity) {
+                        if ((int) $identity['organization'] !== $homeOrganization) {
+                            throw new ImException('群聊不允许包含外机构成员', 'GROUP_MEMBER_ORGANIZATION_FORBIDDEN');
+                        }
+                    }
+                }
+                $recipientIdentities = array_values(array_filter(
+                    $allRecipientIdentities,
+                    static fn (array $identity): bool => (int) $identity['organization'] === $homeOrganization,
+                ));
+                $this->outbox->createConversationRead(
+                    context: $context,
+                    homeOrganization: $homeOrganization,
+                    readState: [
+                        ...$result,
+                        'last_read_message_id' => $homeReadStates[$homeOrganization]['last_read_message_id'],
+                        'last_read_seq' => $homeReadStates[$homeOrganization]['last_read_seq'],
+                        'unread_count' => $homeReadStates[$homeOrganization]['unread_count'],
+                    ],
+                    conversationType: (int) $conversation['conversation_type'],
+                    recipientIdentities: $recipientIdentities,
+                    crossOrgAccessSnapshotId: $access['is_cross_organization']
+                        ? $access['access_snapshot_id']
+                        : null,
+                );
+            }
+
+            return $result;
+        });
 
         return $result;
     }
@@ -95,17 +159,23 @@ final class ConversationSyncService
     /**
      * 查询会话中的活跃成员 user_id 列表。
      *
-     * @return list<string>
+     * @return list<array{organization:int,user_id:string}>
      */
-    private function conversationMembers(int $organization, string $conversationId): array
+    private function conversationMemberIdentities(int $organization, string $conversationId): array
     {
         $rows = $this->repository->fetchAll(
-            'SELECT user_id FROM im_conversation_member
+            'SELECT member_organization, user_id FROM im_conversation_member
               WHERE organization = ? AND conversation_id = ? AND status = 1 AND delete_time IS NULL',
             [$organization, $conversationId],
         );
 
-        return array_values(array_map(static fn (array $row): string => (string) $row['user_id'], $rows));
+        return array_values(array_map(
+            static fn (array $row): array => [
+                'organization' => (int) $row['member_organization'],
+                'user_id' => (string) $row['user_id'],
+            ],
+            $rows,
+        ));
     }
 
     private function visibleMessageSeq(AuthContext $context, string $conversationId, string $messageId): int
@@ -137,6 +207,7 @@ final class ConversationSyncService
                       FROM im_conversation_membership_period mp
                      WHERE mp.organization = m.organization
                        AND mp.conversation_id = m.conversation_id
+                       AND mp.member_organization = ?
                        AND mp.user_id = ?
                        AND mp.status = 1
                        AND m.message_seq >= mp.visible_from_message_seq
@@ -147,10 +218,19 @@ final class ConversationSyncService
                      WHERE ud.organization = m.organization
                        AND ud.conversation_id = m.conversation_id
                        AND ud.message_id = m.message_id
+                       AND ud.user_organization = ?
                        AND ud.user_id = ?
                 )
               LIMIT 1',
-            [$context->organization, $conversationId, $messageId, $context->userId, $context->userId],
+            [
+                $context->organization,
+                $conversationId,
+                $messageId,
+                $context->organization,
+                $context->userId,
+                $context->organization,
+                $context->userId,
+            ],
         );
         if ($message === null) {
             throw new ImException('已读消息不存在或当前用户不可见', 'CONVERSATION_READ_MESSAGE_NOT_VISIBLE');
@@ -170,11 +250,12 @@ final class ConversationSyncService
                 AND c.delete_time IS NULL
               WHERE cm.organization = ?
                 AND cm.conversation_id = ?
+                AND cm.member_organization = ?
                 AND cm.user_id = ?
                 AND cm.status = 1
                 AND cm.delete_time IS NULL
               LIMIT 1',
-            [$context->organization, $conversationId, $context->userId],
+            [$context->organization, $conversationId, $context->organization, $context->userId],
         );
         if ($member === null) {
             throw new ImException('会话不存在或无权访问', 'CONVERSATION_READ_MEMBER_NOT_FOUND');
@@ -183,7 +264,9 @@ final class ConversationSyncService
 
     /** @return array{last_read_message_id: string, last_read_seq: int, unread_count: int} */
     private function advanceReadState(
-        AuthContext $context,
+        int $homeOrganization,
+        int $userOrganization,
+        string $userId,
         string $conversationId,
         string $requestedMessageId,
         int $requestedSeq,
@@ -199,11 +282,12 @@ final class ConversationSyncService
                  AND c.delete_time IS NULL
               WHERE cm.organization = ?
                 AND cm.conversation_id = ?
+                AND cm.member_organization = ?
                 AND cm.user_id = ?
                 AND cm.status = 1
                 AND cm.delete_time IS NULL
               LIMIT 1 FOR UPDATE',
-            [$context->organization, $conversationId, $context->userId],
+            [$homeOrganization, $conversationId, $userOrganization, $userId],
         );
         if ($member === null) {
             throw new ImException('会话不存在或无权访问', 'CONVERSATION_READ_MEMBER_NOT_FOUND');
@@ -218,9 +302,10 @@ final class ConversationSyncService
             $effectiveMessageId = $requestedMessageId;
         }
         $unreadCount = $this->countUnreadAfter(
-            $context->organization,
+            $homeOrganization,
             $conversationId,
-            $context->userId,
+            $userOrganization,
+            $userId,
             $effectiveSeq,
         );
         $this->repository->execute(
@@ -228,6 +313,7 @@ final class ConversationSyncService
                 SET last_read_message_id = ?, last_read_seq = ?, unread_count = ?, update_time = ?
               WHERE organization = ?
                 AND conversation_id = ?
+                AND member_organization = ?
                 AND user_id = ?
                 AND status = 1
                 AND delete_time IS NULL',
@@ -236,9 +322,10 @@ final class ConversationSyncService
                 $effectiveSeq,
                 $unreadCount,
                 $now,
-                $context->organization,
+                $homeOrganization,
                 $conversationId,
-                $context->userId,
+                $userOrganization,
+                $userId,
             ],
         );
 
@@ -250,8 +337,9 @@ final class ConversationSyncService
     }
 
     private function countUnreadAfter(
-        int $organization,
+        int $homeOrganization,
         string $conversationId,
+        int $userOrganization,
         string $userId,
         int $afterSeq,
     ): int {
@@ -261,11 +349,12 @@ final class ConversationSyncService
               WHERE i.organization = ?
                 AND i.conversation_id = ?
                 AND i.message_seq > ?
-                AND i.sender_id <> ?
+                AND NOT (i.sender_organization = ? AND i.sender_id = ?)
                 AND EXISTS (
                     SELECT 1 FROM im_conversation_membership_period mp
                      WHERE mp.organization = i.organization
                        AND mp.conversation_id = i.conversation_id
+                       AND mp.member_organization = ?
                        AND mp.user_id = ?
                        AND mp.status = 1
                        AND i.message_seq >= mp.visible_from_message_seq
@@ -275,6 +364,7 @@ final class ConversationSyncService
                     SELECT 1 FROM im_message_user_delete ud
                      WHERE ud.organization = i.organization
                        AND ud.message_id = i.message_id
+                       AND ud.user_organization = ?
                        AND ud.user_id = ?
                 )
                 AND NOT EXISTS (
@@ -283,9 +373,20 @@ final class ConversationSyncService
                        AND mc.message_id = i.message_id
                        AND mc.change_type = \'delete_both\'
                 )',
-            [$organization, $conversationId, $afterSeq, $userId, $userId, $userId],
+            [
+                $homeOrganization,
+                $conversationId,
+                $afterSeq,
+                $userOrganization,
+                $userId,
+                $userOrganization,
+                $userId,
+                $userOrganization,
+                $userId,
+            ],
         );
 
         return max(0, (int) ($row['aggregate'] ?? 0));
     }
+
 }

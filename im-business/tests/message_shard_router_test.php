@@ -54,6 +54,7 @@ function completeRuntimeTables(): array
         'im_auth_session',
         'im_upload_asset',
         'im_conversation',
+        'im_cross_organization_conversation',
         'im_group_profile',
         'im_conversation_member',
         'im_message_group',
@@ -85,7 +86,7 @@ $repository = new MessageShardRouterTestRepository(completeRuntimeTables());
 (new MessageShardRouter($repository, 1))->preflight();
 $assert(true, '完整运行时表被错误拒绝');
 
-foreach (['im_upload_asset', 'im_web_access_session', 'sm_tenant_im_policy'] as $missingTable) {
+foreach (['im_upload_asset', 'im_web_access_session', 'im_cross_organization_conversation', 'sm_tenant_im_policy'] as $missingTable) {
     $tables = completeRuntimeTables();
     unset($tables[$missingTable]);
     try {

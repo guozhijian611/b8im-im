@@ -44,10 +44,23 @@ function expectInvalidRealtime(callable $callback): void
     throw new RuntimeException('expected InvalidRealtimeEvent');
 }
 
+trait PassThroughRealtimeRecipientBoundary
+{
+    public function withDeliverableIdentities(RealtimeEvent $event, callable $delivery): void
+    {
+        $delivery($this->activeIdentities(
+            $event->organization,
+            $event->conversationId,
+            $event->messageSeq,
+        ));
+    }
+}
+
 /** @return array<string, mixed> */
 function createdRealtimePayload(): array
 {
     return [
+        'event_id' => hash('sha256', 'created-home-7'),
         'event_type' => Constants::MQ_ROUTING_MESSAGE_CREATED,
         'organization' => 7,
         'message_id' => '01JZMESSAGE00000000000000001',
@@ -56,11 +69,18 @@ function createdRealtimePayload(): array
         'conversation_id' => 'group:7:alpha',
         'conversation_type' => 2,
         'sender_id' => 'sender-1',
+        'sender_organization' => 7,
         'actor_user_id' => 'sender-1',
+        'actor_organization' => 7,
         'origin_user_id' => 'sender-1',
+        'origin_organization' => 7,
         'origin_client_id' => 'origin-client',
-        'recipient_count' => 2,
-        'recipient_user_ids' => ['recipient-1', 'left-member'],
+        'recipient_count' => 3,
+        'recipient_identities' => [
+            ['organization' => 7, 'user_id' => 'sender-1'],
+            ['organization' => 7, 'user_id' => 'recipient-1'],
+            ['organization' => 7, 'user_id' => 'left-member'],
+        ],
         'message' => [
             'organization' => 7,
             'conversation_id' => 'group:7:alpha',
@@ -70,6 +90,7 @@ function createdRealtimePayload(): array
             'global_seq' => '99',
             'client_msg_id' => 'web-message-1',
             'sender_id' => 'sender-1',
+            'sender_organization' => 7,
             'sender_user' => ['user_id' => 'sender-1', 'nickname' => 'Sender'],
             'message_type' => 1,
             'content' => ['text' => 'hello'],
@@ -87,6 +108,7 @@ function createdRealtimePayload(): array
 function mutationRealtimePayload(string $eventType): array
 {
     $base = [
+        'event_id' => hash('sha256', 'mutation-' . $eventType),
         'event_type' => $eventType,
         'organization' => 7,
         'conversation_id' => 'group:7:alpha',
@@ -95,9 +117,17 @@ function mutationRealtimePayload(string $eventType): array
         'message_seq' => 12,
         'change_seq' => 3,
         'target_user_id' => null,
+        'target_organization' => null,
         'actor_user_id' => 'sender-1',
+        'actor_organization' => 7,
         'origin_user_id' => 'sender-1',
+        'origin_organization' => 7,
         'origin_client_id' => 'origin-client',
+        'recipient_count' => 2,
+        'recipient_identities' => [
+            ['organization' => 7, 'user_id' => 'recipient-1'],
+            ['organization' => 7, 'user_id' => 'left-member'],
+        ],
         'created_at' => '2026-07-10 12:01:00',
     ];
 
@@ -116,6 +146,7 @@ function mutationRealtimePayload(string $eventType): array
                 'global_seq' => '99',
                 'client_msg_id' => 'web-message-1',
                 'sender_id' => 'sender-1',
+                'sender_organization' => 7,
                 'sender_user' => ['user_id' => 'sender-1', 'nickname' => 'Sender'],
                 'message_type' => 1,
                 'content' => ['text' => 'edited'],
@@ -132,6 +163,9 @@ function mutationRealtimePayload(string $eventType): array
     };
     if ($eventType === Constants::MQ_ROUTING_MESSAGE_DELETED_SELF) {
         $base['target_user_id'] = 'target-1';
+        $base['target_organization'] = 7;
+        $base['recipient_count'] = 1;
+        $base['recipient_identities'] = [['organization' => 7, 'user_id' => 'target-1']];
     }
 
     return $base;
@@ -147,7 +181,11 @@ realtimeTest('created event projects the safe message and idempotency sequences'
     realtimeAssert($event->packetCommand === Command::PUSH);
     realtimeAssert($event->messageSeq === 12 && $event->changeSeq === 0);
     realtimeAssert($event->originUserId === 'sender-1' && $event->originClientId === 'origin-client');
-    realtimeAssert($event->recipientUserIds === ['recipient-1', 'left-member']);
+    realtimeAssert($event->recipientIdentities === [
+        ['organization' => 7, 'user_id' => 'sender-1'],
+        ['organization' => 7, 'user_id' => 'recipient-1'],
+        ['organization' => 7, 'user_id' => 'left-member'],
+    ]);
     $packet = json_decode($event->encodedPacket(), true, flags: JSON_THROW_ON_ERROR);
     realtimeAssert($packet['organization'] === 7);
     realtimeAssert($packet['data']['message_seq'] === 12);
@@ -182,6 +220,222 @@ realtimeTest('mutation events map to client commands and always carry both seque
     }
 });
 
+realtimeTest('receipt and conversation read events preserve composite actor identity', static function (): void {
+    $base = [
+        'organization' => 7,
+        'conversation_id' => 'single_2118193dd11825a86050c3575d1f9aa52849d5e3',
+        'conversation_type' => 1,
+        'message_id' => '01JZMESSAGE00000000000000001',
+        'message_seq' => 12,
+        'change_seq' => 0,
+        'actor_organization' => 8,
+        'actor_user_id' => 'reader-1',
+        'origin_organization' => 8,
+        'origin_user_id' => 'reader-1',
+        'origin_client_id' => 'reader-client',
+        'cross_org_access_snapshot_id' => '41',
+        'recipient_count' => 1,
+        'recipient_identities' => [['organization' => 7, 'user_id' => 'sender-1']],
+        'created_at' => '2026-07-10 12:02:00',
+    ];
+    $receiptPayload = $base + [
+        'event_id' => hash('sha256', 'receipt-home-7'),
+        'event_type' => Constants::MQ_ROUTING_MESSAGE_RECEIPT,
+        'sender_organization' => 7,
+        'sender_id' => 'sender-1',
+        'user_organization' => 8,
+        'user_id' => 'reader-1',
+        'receipt' => [
+            'organization' => 7,
+            'message_id' => '01JZMESSAGE00000000000000001',
+            'conversation_id' => 'single_2118193dd11825a86050c3575d1f9aa52849d5e3',
+            'message_seq' => 12,
+            'global_seq' => '21',
+            'sender_organization' => 7,
+            'sender_id' => 'sender-1',
+            'user_organization' => 8,
+            'user_id' => 'reader-1',
+            'status' => 'read',
+            'last_read_message_id' => '01JZMESSAGE00000000000000001',
+            'last_read_seq' => 12,
+            'unread_count' => 0,
+            'time' => '2026-07-10 12:02:00',
+        ],
+    ];
+    $receipt = (new RealtimeEventProjector())->project(
+        Constants::MQ_ROUTING_MESSAGE_RECEIPT,
+        json_encode($receiptPayload, JSON_THROW_ON_ERROR),
+    );
+    realtimeAssert($receipt->packetCommand === Command::ACK);
+    realtimeAssert($receipt->actorOrganization === 8 && $receipt->organization === 7);
+    realtimeAssert($receipt->crossOrgAccessSnapshotId === '41');
+    $receiptPacket = json_decode($receipt->encodedPacket(), true, flags: JSON_THROW_ON_ERROR);
+    realtimeAssert($receiptPacket['data']['cross_org_access_snapshot_id'] === '41');
+
+    $readPayload = $base + [
+        'event_id' => hash('sha256', 'conversation-read-home-7'),
+        'event_type' => Constants::MQ_ROUTING_CONVERSATION_READ,
+        'user_organization' => 8,
+        'user_id' => 'reader-1',
+        'read_state' => [
+            'conversation_id' => 'single_2118193dd11825a86050c3575d1f9aa52849d5e3',
+            'last_read_message_id' => '01JZMESSAGE00000000000000001',
+            'last_read_seq' => 12,
+            'unread_count' => 0,
+            'user_organization' => 8,
+            'user_id' => 'reader-1',
+            'time' => '2026-07-10 12:02:00',
+        ],
+    ];
+    $read = (new RealtimeEventProjector())->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($readPayload, JSON_THROW_ON_ERROR),
+    );
+    realtimeAssert($read->packetCommand === Command::CONVERSATION_READ);
+    realtimeAssert($read->actorOrganization === 8 && $read->organization === 7);
+    realtimeAssert($read->crossOrgAccessSnapshotId === '41');
+    $readPacket = json_decode($read->encodedPacket(), true, flags: JSON_THROW_ON_ERROR);
+    realtimeAssert($readPacket['data']['cross_org_access_snapshot_id'] === '41');
+});
+
+realtimeTest('conversation access changes project both allowed states without member-policy gating', static function (): void {
+    $projector = new RealtimeEventProjector();
+    $conversationId = 'single_5dd996df2b82554f8a914976e78535f6f6de3384';
+    foreach ([false, true] as $allowed) {
+        $snapshotId = $allowed ? '43' : '42';
+        $payload = [
+            'event_id' => hash('sha256', '7|conversation.access_changed|' . $conversationId . '|' . $snapshotId),
+            'event_type' => Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+            'organization' => 7,
+            'conversation_id' => $conversationId,
+            'conversation_type' => 1,
+            'cross_org_access_snapshot_id' => $snapshotId,
+            'allowed' => $allowed,
+            'target_organization' => 7,
+            'target_user_id' => 'sender-1',
+            'peer_organization' => 8,
+            'peer_user_id' => 'reader-1',
+            'recipient_count' => 1,
+            'recipient_identities' => [['organization' => 7, 'user_id' => 'sender-1']],
+            'created_at' => '2026-07-20 12:00:00',
+        ];
+        $event = $projector->project(
+            Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+            json_encode($payload, JSON_THROW_ON_ERROR),
+        );
+        realtimeAssert($event->packetCommand === Command::CONVERSATION_ACCESS_CHANGED);
+        realtimeAssert($event->targetOrganization === 7 && $event->targetUserId === 'sender-1');
+        $packet = json_decode($event->encodedPacket(), true, flags: JSON_THROW_ON_ERROR);
+        realtimeAssert($packet['data']['cross_org_access_snapshot_id'] === $snapshotId);
+        realtimeAssert($packet['data']['allowed'] === $allowed);
+        realtimeAssert($packet['data']['target_organization'] === 7);
+        realtimeAssert($packet['data']['target_user_id'] === 'sender-1');
+        realtimeAssert($packet['data']['peer_organization'] === 8);
+        realtimeAssert($packet['data']['peer_user_id'] === 'reader-1');
+
+        $provider = new class() implements RealtimeRecipientProvider {
+            use PassThroughRealtimeRecipientBoundary;
+
+            public int $calls = 0;
+            public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
+            {
+                ++$this->calls;
+                return [];
+            }
+        };
+        $gateway = new class() implements RealtimeGateway {
+            public array $packets = [];
+            public function clientIdsForOrganizationUser(int $organization, string $userId): array
+            {
+                return ['access-client'];
+            }
+            public function sendToClient(string $clientId, string $packet): void
+            {
+                $this->packets[] = json_decode($packet, true, flags: JSON_THROW_ON_ERROR);
+            }
+        };
+        $checkpoints = new class() implements RealtimeDeliveryCheckpoint {
+            public function wasDelivered(RealtimeEvent $event, string $clientId): bool { return false; }
+            public function markDelivered(RealtimeEvent $event, string $clientId): void {}
+        };
+        (new RealtimeDeliveryService($provider, $gateway, $checkpoints))->deliver($event);
+        realtimeAssert($provider->calls === 0, 'access event must not be gated by current membership/policy');
+        realtimeAssert(count($gateway->packets) === 1);
+    }
+
+    $legacy = $payload;
+    unset($legacy['cross_org_access_snapshot_id'], $legacy['allowed']);
+    $legacy['access_snapshot_id'] = '43';
+    $legacy['access_allowed'] = true;
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+        json_encode($legacy, JSON_THROW_ON_ERROR),
+    ));
+
+    $invalid = [
+        'event_id' => hash('sha256', '7|conversation.access_changed|' . $conversationId . '|01'),
+        'event_type' => Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+        'organization' => 7,
+        'conversation_id' => $conversationId,
+        'conversation_type' => 1,
+        'cross_org_access_snapshot_id' => '01',
+        'allowed' => false,
+        'target_organization' => 7,
+        'target_user_id' => 'sender-1',
+        'peer_organization' => 8,
+        'peer_user_id' => 'reader-1',
+        'recipient_count' => 1,
+        'recipient_identities' => [['organization' => 7, 'user_id' => 'sender-1']],
+        'created_at' => '2026-07-20 12:00:00',
+    ];
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+        json_encode($invalid, JSON_THROW_ON_ERROR),
+    ));
+    $invalid['cross_org_access_snapshot_id'] = '44';
+    $invalid['event_id'] = hash('sha256', '7|conversation.access_changed|' . $conversationId . '|44');
+    $invalid['recipient_identities'] = [['organization' => 8, 'user_id' => 'reader-1']];
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+        json_encode($invalid, JSON_THROW_ON_ERROR),
+    ));
+    $invalid['recipient_identities'] = [['organization' => 7, 'user_id' => 'sender-1']];
+    $invalid['peer_user_id'] = 'another-peer';
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+        json_encode($invalid, JSON_THROW_ON_ERROR),
+    ));
+});
+
+realtimeTest('recipient organizations outside the event home are rejected before intersection', static function (): void {
+    $payload = createdRealtimePayload();
+    $payload['recipient_identities'][] = ['organization' => 8, 'user_id' => 'foreign'];
+    $payload['recipient_count'] = 4;
+    $event = (new RealtimeEventProjector())->project(
+        Constants::MQ_ROUTING_MESSAGE_CREATED,
+        json_encode($payload, JSON_THROW_ON_ERROR),
+    );
+    $provider = new class() implements RealtimeRecipientProvider {
+        use PassThroughRealtimeRecipientBoundary;
+
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array { return []; }
+    };
+    $gateway = new class() implements RealtimeGateway {
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array { return []; }
+        public function sendToClient(string $clientId, string $packet): void {}
+    };
+    $checkpoints = new class() implements RealtimeDeliveryCheckpoint {
+        public function wasDelivered(RealtimeEvent $event, string $clientId): bool { return false; }
+        public function markDelivered(RealtimeEvent $event, string $clientId): void {}
+    };
+    try {
+        (new RealtimeDeliveryService($provider, $gateway, $checkpoints))->deliver($event);
+        throw new RuntimeException('expected foreign recipient rejection');
+    } catch (RuntimeException $exception) {
+        realtimeAssert(str_contains($exception->getMessage(), 'outside its home projection'));
+    }
+});
+
 realtimeTest('bad JSON, routing conflicts and cross-envelope identities are rejected', static function (): void {
     $projector = new RealtimeEventProjector();
     expectInvalidRealtime(static fn () => $projector->project(Constants::MQ_ROUTING_MESSAGE_CREATED, '{'));
@@ -202,8 +456,8 @@ realtimeTest('bad JSON, routing conflicts and cross-envelope identities are reje
     ));
 
     $payload = createdRealtimePayload();
-    $payload['recipient_user_ids'][] = 'recipient-1';
-    $payload['recipient_count'] = 3;
+    $payload['recipient_identities'][] = ['organization' => 7, 'user_id' => 'recipient-1'];
+    $payload['recipient_count'] = 4;
     expectInvalidRealtime(static fn () => $projector->project(
         Constants::MQ_ROUTING_MESSAGE_CREATED,
         json_encode($payload, JSON_THROW_ON_ERROR),
@@ -216,6 +470,15 @@ realtimeTest('bad JSON, routing conflicts and cross-envelope identities are reje
         json_encode($payload, JSON_THROW_ON_ERROR),
     ));
 
+    foreach (['0', '01', 1, '', str_repeat('9', 21)] as $invalidSnapshotId) {
+        $payload = createdRealtimePayload();
+        $payload['cross_org_access_snapshot_id'] = $invalidSnapshotId;
+        expectInvalidRealtime(static fn () => $projector->project(
+            Constants::MQ_ROUTING_MESSAGE_CREATED,
+            json_encode($payload, JSON_THROW_ON_ERROR),
+        ));
+    }
+
     $payload = mutationRealtimePayload(Constants::MQ_ROUTING_MESSAGE_EDITED);
     $payload['payload']['message']['conversation_id'] = 'group:7:other';
     expectInvalidRealtime(static fn () => $projector->project(
@@ -226,12 +489,18 @@ realtimeTest('bad JSON, routing conflicts and cross-envelope identities are reje
 
 realtimeTest('created recipients are intersected with current organization members', static function (): void {
     $provider = new class() implements RealtimeRecipientProvider {
+        use PassThroughRealtimeRecipientBoundary;
+
         public array $calls = [];
 
-        public function activeUserIds(int $organization, string $conversationId, int $messageSeq): array
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
         {
             $this->calls[] = [$organization, $conversationId, $messageSeq];
-            return ['sender-1', 'recipient-1', 'current-not-in-event'];
+            return [
+                ['organization' => 7, 'user_id' => 'sender-1'],
+                ['organization' => 7, 'user_id' => 'recipient-1'],
+                ['organization' => 7, 'user_id' => 'current-not-in-event'],
+            ];
         }
     };
     $gateway = new class() implements RealtimeGateway {
@@ -285,10 +554,20 @@ realtimeTest('system notices reach recipients without becoming an unread origin 
         'actor_user_id' => 'sender-1',
         'text' => '截屏提示',
     ];
+    $payload['recipient_count'] = 2;
+    $payload['recipient_identities'] = [
+        ['organization' => 7, 'user_id' => 'recipient-1'],
+        ['organization' => 7, 'user_id' => 'left-member'],
+    ];
     $provider = new class() implements RealtimeRecipientProvider {
-        public function activeUserIds(int $organization, string $conversationId, int $messageSeq): array
+        use PassThroughRealtimeRecipientBoundary;
+
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
         {
-            return ['sender-1', 'recipient-1'];
+            return [
+                ['organization' => 7, 'user_id' => 'sender-1'],
+                ['organization' => 7, 'user_id' => 'recipient-1'],
+            ];
         }
     };
     $gateway = new class() implements RealtimeGateway {
@@ -329,9 +608,14 @@ realtimeTest('system notices reach recipients without becoming an unread origin 
 
 realtimeTest('client checkpoints suppress redelivery and resume only failed clients', static function (): void {
     $provider = new class() implements RealtimeRecipientProvider {
-        public function activeUserIds(int $organization, string $conversationId, int $messageSeq): array
+        use PassThroughRealtimeRecipientBoundary;
+
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
         {
-            return ['recipient-1', 'left-member'];
+            return [
+                ['organization' => 7, 'user_id' => 'recipient-1'],
+                ['organization' => 7, 'user_id' => 'left-member'],
+            ];
         }
     };
     $gateway = new class() implements RealtimeGateway {
@@ -389,12 +673,17 @@ realtimeTest('client checkpoints suppress redelivery and resume only failed clie
 
 realtimeTest('delete_self bypasses member fanout and targets only its organization user', static function (): void {
     $provider = new class() implements RealtimeRecipientProvider {
+        use PassThroughRealtimeRecipientBoundary;
+
         public int $calls = 0;
 
-        public function activeUserIds(int $organization, string $conversationId, int $messageSeq): array
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
         {
             ++$this->calls;
-            return ['target-1', 'other-1'];
+            return [
+                ['organization' => 7, 'user_id' => 'target-1'],
+                ['organization' => 7, 'user_id' => 'other-1'],
+            ];
         }
     };
     $gateway = new class() implements RealtimeGateway {
@@ -426,7 +715,7 @@ realtimeTest('delete_self bypasses member fanout and targets only its organizati
     );
     (new RealtimeDeliveryService($provider, $gateway, $checkpoints))->deliver($event);
 
-    realtimeAssert($provider->calls === 0);
+    realtimeAssert($provider->calls === 1);
     realtimeAssert($gateway->deliveries === ['client-target-1']);
 });
 
@@ -443,6 +732,144 @@ realtimeTest('durable message handlers do not perform a second direct fanout', s
         realtimeAssert(!str_contains($match[0], 'Gateway::sendToUid'), $handler . ' still directly fans out to a user');
         realtimeAssert(!str_contains($match[0], 'Gateway::getClientIdByUid'), $handler . ' still directly fans out to sibling clients');
     }
+});
+
+realtimeTest('Gateway fanout stays inside the authorization boundary callback', static function (): void {
+    $provider = new class() implements RealtimeRecipientProvider {
+        public bool $insideBoundary = false;
+
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
+        {
+            throw new RuntimeException('legacy recipient lookup must not be used for delivery');
+        }
+
+        public function withDeliverableIdentities(RealtimeEvent $event, callable $delivery): void
+        {
+            $this->insideBoundary = true;
+            try {
+                $delivery([['organization' => 7, 'user_id' => 'recipient-1']]);
+            } finally {
+                $this->insideBoundary = false;
+            }
+        }
+    };
+    $gateway = new class($provider) implements RealtimeGateway {
+        public int $deliveries = 0;
+
+        public function __construct(private readonly object $provider)
+        {
+        }
+
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array
+        {
+            realtimeAssert($this->provider->insideBoundary, 'Gateway lookup escaped authorization boundary');
+            return ['recipient-client'];
+        }
+
+        public function sendToClient(string $clientId, string $packet): void
+        {
+            realtimeAssert($this->provider->insideBoundary, 'Gateway send escaped authorization boundary');
+            ++$this->deliveries;
+        }
+    };
+    $checkpoints = new class($provider) implements RealtimeDeliveryCheckpoint {
+        public function __construct(private readonly object $provider)
+        {
+        }
+
+        public function wasDelivered(RealtimeEvent $event, string $clientId): bool
+        {
+            realtimeAssert($this->provider->insideBoundary, 'checkpoint read escaped authorization boundary');
+            return false;
+        }
+
+        public function markDelivered(RealtimeEvent $event, string $clientId): void
+        {
+            realtimeAssert($this->provider->insideBoundary, 'checkpoint write escaped authorization boundary');
+        }
+    };
+
+    $event = (new RealtimeEventProjector())->project(
+        Constants::MQ_ROUTING_MESSAGE_CREATED,
+        json_encode(createdRealtimePayload(), JSON_THROW_ON_ERROR),
+    );
+    (new RealtimeDeliveryService($provider, $gateway, $checkpoints))->deliver($event);
+
+    realtimeAssert($gateway->deliveries === 1 && !$provider->insideBoundary);
+});
+
+realtimeTest('stale realtime event is ACKed and retry state is cleared without Gateway access', static function (): void {
+    $provider = new class() implements RealtimeRecipientProvider {
+        public int $boundaries = 0;
+
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
+        {
+            throw new RuntimeException('legacy recipient lookup must not be used for delivery');
+        }
+
+        public function withDeliverableIdentities(RealtimeEvent $event, callable $delivery): void
+        {
+            ++$this->boundaries;
+            $delivery([]);
+        }
+    };
+    $gateway = new class() implements RealtimeGateway {
+        public int $calls = 0;
+
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array
+        {
+            ++$this->calls;
+            return [];
+        }
+
+        public function sendToClient(string $clientId, string $packet): void
+        {
+            ++$this->calls;
+        }
+    };
+    $checkpoints = new class() implements RealtimeDeliveryCheckpoint {
+        public int $calls = 0;
+
+        public function wasDelivered(RealtimeEvent $event, string $clientId): bool
+        {
+            ++$this->calls;
+            return false;
+        }
+
+        public function markDelivered(RealtimeEvent $event, string $clientId): void
+        {
+            ++$this->calls;
+        }
+    };
+    $counter = new class() implements RealtimeRetryCounter {
+        public int $increments = 0;
+        public int $clears = 0;
+
+        public function increment(RealtimeEvent $event): int
+        {
+            return ++$this->increments;
+        }
+
+        public function clear(RealtimeEvent $event): void
+        {
+            ++$this->clears;
+        }
+    };
+    $handler = new RealtimeDeliveryHandler(
+        new RealtimeEventProjector(),
+        new RealtimeDeliveryService($provider, $gateway, $checkpoints),
+        $counter,
+        2,
+    );
+    $result = $handler->handle(
+        Constants::MQ_ROUTING_MESSAGE_CREATED,
+        json_encode(createdRealtimePayload(), JSON_THROW_ON_ERROR),
+    );
+
+    realtimeAssert($result->outcome === RealtimeDeliveryResult::ACK);
+    realtimeAssert($provider->boundaries === 1);
+    realtimeAssert($gateway->calls === 0 && $checkpoints->calls === 0);
+    realtimeAssert($counter->clears === 1 && $counter->increments === 0);
 });
 
 realtimeTest('delivery handler ACKs success only after delivery and retry cleanup', static function (): void {

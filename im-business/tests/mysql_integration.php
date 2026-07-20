@@ -228,20 +228,23 @@ try {
     );
     $repository->execute(
         'INSERT INTO im_friend_request
-            (organization, from_user_id, to_user_id, add_method, message, status, create_time, update_time)
-         VALUES (1, ?, ?, "username", "integration request", 1, ?, ?)',
+            (organization, from_organization, to_organization, from_user_id, to_user_id,
+             add_method, message, status, create_time, update_time)
+         VALUES (1, 1, 1, ?, ?, "username", "integration request", 1, ?, ?)',
         [$senderId, $recipientId, $now, $now],
     );
     $repository->execute(
         'INSERT INTO im_friend_relation
-            (organization, user_id, friend_user_id, add_method, added_at, remark_name, card_remark, status, create_time, update_time)
-         VALUES (1, ?, ?, "username", ?, "integration friend", "integration card", 1, ?, ?)',
+            (organization, user_id, friend_user_id, friend_organization, add_method,
+             added_at, remark_name, card_remark, status, create_time, update_time)
+         VALUES (1, ?, ?, 1, "username", ?, "integration friend", "integration card", 1, ?, ?)',
         [$senderId, $recipientId, $now, $now, $now],
     );
     $repository->execute(
         'INSERT INTO im_friend_relation
-            (organization, user_id, friend_user_id, add_method, added_at, remark_name, card_remark, status, create_time, update_time)
-         VALUES (1, ?, ?, "username", ?, "integration reciprocal", "integration card", 1, ?, ?)',
+            (organization, user_id, friend_user_id, friend_organization, add_method,
+             added_at, remark_name, card_remark, status, create_time, update_time)
+         VALUES (1, ?, ?, 1, "username", ?, "integration reciprocal", "integration card", 1, ?, ?)',
         [$recipientId, $senderId, $now, $now, $now],
     );
     $repository->execute(
@@ -547,6 +550,7 @@ try {
             cmd: 'send',
             data: [
                 'to_user_id' => $recipientId,
+                'to_organization' => 1,
                 'conversation_type' => 1,
                 'message_type' => MessageType::TEXT,
                 'content' => ['text' => $text],
@@ -561,6 +565,7 @@ try {
             $context($senderId),
             new Packet('send', [
                 'to_user_id' => $recipientId,
+                'to_organization' => 1,
                 'conversation_type' => 1,
                 'message_type' => MessageType::SYSTEM,
                 'content' => ['text' => 'forged system notice'],
@@ -578,6 +583,7 @@ try {
             $context($senderId),
             new Packet('send', [
                 'to_user_id' => $otherId,
+                'to_organization' => 1,
                 'conversation_type' => 1,
                 'message_type' => MessageType::TEXT,
                 'content' => ['text' => 'friend boundary probe'],
@@ -704,9 +710,21 @@ try {
         [$conversationId],
     );
 
+    try {
+        $messages->ack($context($recipientId), [
+            'message_id' => $first['message']['message_id'],
+            'status' => 'read',
+        ]);
+        throw new RuntimeException('ACK without request client_msg_id was accepted');
+    } catch (ImException $exception) {
+        if ($exception->errorCode() !== 'ACK_CLIENT_MSG_ID_INVALID') {
+            throw $exception;
+        }
+    }
     $ack = $messages->ack($context($recipientId), [
         'message_id' => $first['message']['message_id'],
         'status' => 'read',
+        'client_msg_id' => 'it-ack-first-' . $suffix,
     ]);
     if (
         $ack['organization'] !== 1
@@ -730,6 +748,7 @@ try {
     $messages->ack($context($recipientId), [
         'message_id' => $second['message']['message_id'],
         'status' => 'read',
+        'client_msg_id' => 'it-ack-second-' . $suffix,
     ]);
     $fullyReadState = $repository->fetchOne(
         'SELECT unread_count, last_read_message_id, last_read_seq
@@ -745,6 +764,7 @@ try {
     $lateDelivered = $messages->ack($context($recipientId), [
         'message_id' => $first['message']['message_id'],
         'status' => 'delivered',
+        'client_msg_id' => 'it-ack-late-' . $suffix,
     ]);
     $nonRegressedState = $repository->fetchOne(
         'SELECT unread_count, last_read_message_id, last_read_seq
@@ -759,6 +779,7 @@ try {
         $messages->ack($context($recipientId), [
             'message_id' => $first['message']['message_id'],
             'status' => 2,
+            'client_msg_id' => 'it-ack-invalid-status-' . $suffix,
         ]);
         throw new RuntimeException('numeric ACK status was accepted');
     } catch (ImException $exception) {
@@ -805,9 +826,11 @@ try {
     $edit = $messages->edit($context($senderId), [
         'message_id' => $first['message']['message_id'],
         'content' => ['text' => 'integration edited'],
+        'client_msg_id' => 'it-edit-first-' . $suffix,
     ]);
     $recall = $messages->recall($context($senderId), [
         'message_id' => $second['message']['message_id'],
+        'client_msg_id' => 'it-recall-second-' . $suffix,
     ]);
     if (is_array($recall['notice_message'] ?? null)) {
         $createdMessageIds[] = (string) $recall['notice_message']['message_id'];
@@ -815,6 +838,7 @@ try {
     $deleteSelf = $messages->delete($context($recipientId), [
         'message_id' => $first['message']['message_id'],
         'scope' => 'self',
+        'client_msg_id' => 'it-delete-self-first-' . $suffix,
     ]);
     if ($edit['change_seq'] !== 1 || $recall['change_seq'] !== 2 || $deleteSelf['change_seq'] !== 3) {
         throw new RuntimeException('message change_seq allocation is not monotonic');
@@ -930,6 +954,7 @@ try {
         $context($senderId),
         new Packet('send', [
             'to_user_id' => $recipientId,
+            'to_organization' => 1,
             'conversation_type' => 1,
             'message_type' => MessageType::IMAGE,
             'content' => [
@@ -976,6 +1001,7 @@ try {
             $context($recipientId),
             new Packet('send', [
                 'to_user_id' => $senderId,
+                'to_organization' => 1,
                 'conversation_type' => 1,
                 'message_type' => MessageType::IMAGE,
                 'content' => ['file_id' => $assetFileId],
@@ -991,8 +1017,9 @@ try {
     $groupConversationId = 'it-group-' . $suffix;
     $repository->execute(
         'INSERT INTO im_conversation
-            (organization, conversation_id, conversation_type, title, owner_user_id, status, create_time, update_time)
-         VALUES (1, ?, 2, ?, ?, 1, ?, ?)',
+            (organization, conversation_id, conversation_type, title, owner_user_id,
+             owner_organization, status, create_time, update_time)
+         VALUES (1, ?, 2, ?, ?, 1, 1, ?, ?)',
         [$groupConversationId, 'integration group', $senderId, $now, $now],
     );
     $repository->execute(
@@ -1006,14 +1033,16 @@ try {
         $isOwner = $groupMemberId === $senderId;
         $repository->execute(
             'INSERT INTO im_conversation_member
-                (organization, conversation_id, user_id, member_role, inviter_user_id, status,
-                 access_version, join_at, create_time, update_time)
-             VALUES (1, ?, ?, ?, ?, 1, 1, ?, ?, ?)',
+                (organization, conversation_id, user_id, member_organization, member_role,
+                 inviter_user_id, inviter_organization, status, access_version,
+                 join_at, create_time, update_time)
+             VALUES (1, ?, ?, 1, ?, ?, ?, 1, 1, ?, ?, ?)',
             [
                 $groupConversationId,
                 $groupMemberId,
                 $isOwner ? 'owner' : 'member',
                 $isOwner ? null : $senderId,
+                $isOwner ? 0 : 1,
                 $now,
                 $now,
                 $now,
@@ -1021,9 +1050,10 @@ try {
         );
         $repository->execute(
             'INSERT INTO im_conversation_membership_period
-                (organization, conversation_id, user_id, period_no, visible_from_message_seq,
-                 visible_until_message_seq, join_at, leave_at, status, create_time, update_time)
-             VALUES (1, ?, ?, 1, 1, NULL, ?, NULL, 1, ?, ?)',
+                (organization, conversation_id, user_id, member_organization, period_no,
+                 visible_from_message_seq, visible_until_message_seq, join_at,
+                 leave_at, status, create_time, update_time)
+             VALUES (1, ?, ?, 1, 1, 1, NULL, ?, NULL, 1, ?, ?)',
             [$groupConversationId, $groupMemberId, $now, $now, $now],
         );
     }
@@ -1105,17 +1135,19 @@ try {
     );
     $repository->execute(
         'INSERT INTO im_conversation_membership_period
-            (organization, conversation_id, user_id, period_no, visible_from_message_seq,
-             visible_until_message_seq, join_at, leave_at, status, create_time, update_time)
-         VALUES (1, ?, ?, 2, ?, NULL, ?, NULL, 1, ?, ?)',
+            (organization, conversation_id, user_id, member_organization, period_no,
+             visible_from_message_seq, visible_until_message_seq, join_at,
+             leave_at, status, create_time, update_time)
+         VALUES (1, ?, ?, 1, 2, ?, NULL, ?, NULL, 1, ?, ?)',
         [$groupConversationId, $recipientId, $groupSecond['message']['message_seq'] + 1, $now, $now, $now],
     );
 
-    $mutationRecipients = (new DatabaseRealtimeRecipientProvider($repository))->activeUserIds(
+    $mutationRecipientIdentities = (new DatabaseRealtimeRecipientProvider($repository))->activeIdentities(
         1,
         $groupConversationId,
         (int) $groupSecond['message']['message_seq'],
     );
+    $mutationRecipients = array_column($mutationRecipientIdentities, 'user_id');
     if (in_array($recipientId, $mutationRecipients, true)) {
         throw new RuntimeException('late/rejoined since_join member could receive a mutation for a hidden message');
     }

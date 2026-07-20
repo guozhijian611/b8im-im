@@ -15,6 +15,8 @@ use B8im\ImBusiness\Connection\ConnectionStore;
 use B8im\ImBusiness\Module\ModuleRegistry;
 use B8im\ImBusiness\Repository\ImRepository;
 use B8im\ImBusiness\Service\ConversationSyncService;
+use B8im\ImBusiness\Service\CrossOrganizationConversationAccess;
+use B8im\ImBusiness\Service\CrossOrganizationSocialPolicy;
 use B8im\ImBusiness\Service\DeviceService;
 use B8im\ImBusiness\Service\MessageService;
 use B8im\ImBusiness\Service\ModuleLicenseChecker;
@@ -38,6 +40,8 @@ final class Runtime
     private static ?TypingService $typing = null;
     private static ?PresenceService $presence = null;
     private static ?ConversationSyncService $conversationSync = null;
+    private static ?CrossOrganizationSocialPolicy $crossOrgSocial = null;
+    private static ?CrossOrganizationConversationAccess $conversationAccess = null;
     private static ?ModuleLicenseChecker $moduleLicense = null;
     private static ?TenantImPolicyService $tenantImPolicies = null;
     private static ?CmdDispatcher $cmdDispatcher = null;
@@ -55,17 +59,27 @@ final class Runtime
         self::$connections = ConnectionStore::connect($config);
         self::$devices = new DeviceService($repository);
         self::$tenantImPolicies = TenantImPolicyService::connect($config, $repository);
+        self::$crossOrgSocial = new CrossOrganizationSocialPolicy($repository);
+        self::$conversationAccess = new CrossOrganizationConversationAccess($repository, self::$crossOrgSocial);
+        $outbox = new OutboxService($repository, $config);
         self::$messages = new MessageService(
             $repository,
             $config,
-            new OutboxService($repository, $config),
+            $outbox,
             self::$tenantImPolicies,
+            self::$crossOrgSocial,
+            self::$conversationAccess,
         );
         self::$messages->preflight();
-        self::$realtimeEvents = RealtimeEventConsumer::connect($config, self::$tenantImPolicies);
-        self::$typing = new TypingService($repository);
+        self::$realtimeEvents = RealtimeEventConsumer::connect(
+            $config,
+            self::$tenantImPolicies,
+            $repository,
+            self::$conversationAccess,
+        );
+        self::$typing = new TypingService($repository, self::$conversationAccess);
         self::$presence = PresenceService::connect($config);
-        self::$conversationSync = new ConversationSyncService($repository);
+        self::$conversationSync = new ConversationSyncService($repository, $outbox, self::$conversationAccess);
         self::$moduleLicense = ModuleLicenseChecker::connect($config, $repository);
 
         // 模块 cmd 分发器：商业模块（客服/音视频等）在此注册自己的 cmd + license 门控
@@ -141,5 +155,10 @@ final class Runtime
     public static function tenantImPolicies(): TenantImPolicyService
     {
         return self::$tenantImPolicies ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function crossOrgSocial(): CrossOrganizationSocialPolicy
+    {
+        return self::$crossOrgSocial ?? throw new \RuntimeException('IM Runtime 尚未启动');
     }
 }

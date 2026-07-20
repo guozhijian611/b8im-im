@@ -59,10 +59,7 @@ LUA;
     {
         return sprintf(
             Constants::REDIS_REALTIME_RETRY,
-            $event->organization,
-            $event->messageId,
-            $event->eventType,
-            $event->changeSeq,
+            $event->eventId(),
         );
     }
 }
