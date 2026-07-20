@@ -61,6 +61,14 @@ final class TypingService
         ): void {
             // Keep the shared access boundary locked until every relay has been
             // handed to Gateway, so a revoke cannot commit in the middle.
+            if (count($accessPreview['home_organizations']) === 2) {
+                $this->conversationAccess->lockCrossOrganizationWriteBoundary(
+                    $accessPreview['home_organizations'],
+                );
+                $this->conversationAccess->lockHomeTenantPolicies(
+                    $accessPreview['home_organizations'],
+                );
+            }
             $this->conversationAccess->assertAccessible(
                 $context->organization,
                 $conversationId,

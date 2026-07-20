@@ -333,6 +333,35 @@ test('typing and SYNC changes expose only canonical actor identity fields', stat
     assertTrue(!str_contains($typingSource, "'user_organization' => \$context->organization"));
     assertTrue(!str_contains($typingSource, "'user_id' => \$context->userId"));
 
+    $typingTransaction = substr(
+        $typingSource,
+        strpos($typingSource, '$this->repository->transaction('),
+    );
+    $globalBoundaryPosition = strpos(
+        $typingTransaction,
+        'lockCrossOrganizationWriteBoundary(',
+    );
+    $tenantBoundaryPosition = strpos(
+        $typingTransaction,
+        'lockHomeTenantPolicies(',
+    );
+    $conversationBoundaryPosition = strpos(
+        $typingTransaction,
+        'assertAccessible(',
+    );
+    assertTrue(
+        is_int($globalBoundaryPosition)
+            && is_int($tenantBoundaryPosition)
+            && is_int($conversationBoundaryPosition)
+            && $globalBoundaryPosition < $tenantBoundaryPosition
+            && $tenantBoundaryPosition < $conversationBoundaryPosition,
+        'typing must lock global/org, then both tenant policies, before conversation rows',
+    );
+    assertTrue(
+        !str_contains($typingSource, 'sm_tenant_im_policy'),
+        'typing must reuse the centralized tenant-policy lock implementation',
+    );
+
     $messageSource = (string) file_get_contents(
         dirname(__DIR__) . '/src/Service/MessageService.php',
     );

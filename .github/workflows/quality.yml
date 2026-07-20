@@ -159,7 +159,7 @@ jobs:
             exit 1
           fi
           grep -Fq '[PASS] same device connections coexist with exact session binding and cleanup' /tmp/im-business-test.log
-          grep -Fq '163 passed, 0 failed' /tmp/im-business-test.log
+          grep -Fq '176 passed, 0 failed' /tmp/im-business-test.log
           grep -Fq 'migration up succeeds again after destructive down' /tmp/im-business-test.log
 
       - name: Syntax-check register
