@@ -4,15 +4,21 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "9269bcf7900e8685dc67ffb46589a11e",
+    "content-hash": "a57fb8bd0f95504f64b61251826a4898",
     "packages": [
         {
             "name": "b8im/im-shared",
-            "version": "1.1.0",
+            "version": "v1.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/guozhijian611/b8im-im-shared.git",
+                "reference": "727e0b16558369631d8acdc46a4a0d82d4c7d326"
+            },
             "dist": {
-                "type": "path",
-                "url": "../../b8im-im-shared",
-                "reference": "e2cc3b8f604f5f98324f60402fcccebbee9dab32"
+                "type": "zip",
+                "url": "https://api.github.com/repos/guozhijian611/b8im-im-shared/zipball/727e0b16558369631d8acdc46a4a0d82d4c7d326",
+                "reference": "727e0b16558369631d8acdc46a4a0d82d4c7d326",
+                "shasum": ""
             },
             "require": {
                 "php": ">=8.1"
@@ -35,9 +41,7 @@
                 "MIT"
             ],
             "description": "b8im IM 通信层公共包：消息协议、常量、工具，供 im-gateway / im-register / im-business 复用。",
-            "transport-options": {
-                "relative": true
-            }
+            "time": "2026-07-20T21:03:45+00:00"
         },
         {
             "name": "graham-campbell/result-type",

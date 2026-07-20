@@ -15,7 +15,7 @@
         "php-http/guzzle7-adapter": "^1.0"
     },
     "repositories": [
-        { "type": "path", "url": "../../b8im-im-shared", "options": { "versions": { "b8im/im-shared": "1.1.0" } } }
+        { "type": "vcs", "url": "https://github.com/guozhijian611/b8im-im-shared.git", "no-api": true }
     ],
     "autoload": {
         "psr-4": {
