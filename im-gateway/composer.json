@@ -10,7 +10,7 @@
         "b8im/im-shared": "^1.0"
     },
     "repositories": [
-        { "type": "path", "url": "../../b8im-im-shared" }
+        { "type": "path", "url": "../../b8im-im-shared", "options": { "versions": { "b8im/im-shared": "1.1.0" } } }
     ],
     "autoload": {
         "psr-4": {

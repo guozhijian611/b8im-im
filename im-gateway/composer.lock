@@ -4,15 +4,15 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "863ac152b410518a262503efa55513a5",
+    "content-hash": "f185768eeba46f489764638b4b5319b2",
     "packages": [
         {
             "name": "b8im/im-shared",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "dist": {
                 "type": "path",
                 "url": "../../b8im-im-shared",
-                "reference": "d315419884547cad4cf638653aa711ed7213390e"
+                "reference": "e2cc3b8f604f5f98324f60402fcccebbee9dab32"
             },
             "require": {
                 "php": ">=8.1"
