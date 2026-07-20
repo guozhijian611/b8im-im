@@ -377,12 +377,12 @@ $messages = new MessageService(
     new CrossOrganizationSocialPolicy($repository),
 );
 
-$context = static function (int $org, string $userId) use ($suffix): AuthContext {
+$context = static function (int $org, string $userId, ?string $clientId = null) use ($suffix): AuthContext {
     return new AuthContext(
         organization: $org,
         userId: $userId,
         deviceId: 'dev-' . $suffix,
-        clientId: 'client-' . $suffix . '-' . $userId,
+        clientId: $clientId ?? 'client-' . $suffix . '-' . $userId,
         credentialSessionId: 'cred-' . $suffix,
         sessionId: md5('sess-' . $suffix . $userId),
         clientFamily: 'web',
@@ -730,6 +730,63 @@ try {
             'same-organization SEND ignores an unrelated peer-home policy',
         );
         $sameOrgConversationId = (string) ($sameOrgSend['message']['conversation_id'] ?? '');
+        $sameOrgReadClientId = 'same-org-read-' . $suffix;
+        $sameOrgRead = (new ConversationSyncService(
+            $repository,
+            new OutboxService($repository, $config),
+        ))->markRead(
+            $context($orgA, $userA, $sameOrgReadClientId),
+            'same-org-read-connection-' . $suffix,
+            $sameOrgConversationId,
+            (string) ($sameOrgSend['message']['message_id'] ?? ''),
+        );
+        $sameOrgReadOutbox = $repository->fetchOne(
+            'SELECT event_id, routing_key, payload_json FROM im_message_outbox
+              WHERE organization = ? AND conversation_id = ? AND event_type = ? LIMIT 1',
+            [$orgA, $sameOrgConversationId, Constants::MQ_ROUTING_CONVERSATION_READ],
+        );
+        $sameOrgReadPayload = json_decode(
+            (string) ($sameOrgReadOutbox['payload_json'] ?? '{}'),
+            true,
+            flags: JSON_THROW_ON_ERROR,
+        );
+        $sameOrgExpectedReadEventId = hash(
+            'sha256',
+            $orgA . '|' . Constants::MQ_ROUTING_CONVERSATION_READ . '|' . $sameOrgConversationId
+                . '|' . $orgA . '|' . $userA . '|' . (int) ($sameOrgRead['last_read_seq'] ?? 0),
+        );
+        $assert(
+            (string) ($sameOrgReadOutbox['event_id'] ?? '') === $sameOrgExpectedReadEventId,
+            'same-organization conversation_read keeps the legacy canonical event tuple',
+        );
+        $assert(
+            !array_key_exists('cross_org_access_snapshot_id', $sameOrgRead)
+                && !array_key_exists('cross_org_access_snapshot_id', $sameOrgReadPayload)
+                && !array_key_exists(
+                    'cross_org_access_snapshot_id',
+                    (array) ($sameOrgReadPayload['read_state'] ?? []),
+                )
+                && ($sameOrgReadPayload['origin_client_id'] ?? '') === $sameOrgReadClientId,
+            'same-organization conversation_read result and outbox omit snapshot and preserve AuthContext origin client',
+        );
+        $sameOrgProjectedRead = (new RealtimeEventProjector())->project(
+            (string) ($sameOrgReadOutbox['routing_key'] ?? ''),
+            json_encode($sameOrgReadPayload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+        );
+        $sameOrgProjectedPacket = json_decode(
+            $sameOrgProjectedRead->encodedPacket(),
+            true,
+            flags: JSON_THROW_ON_ERROR,
+        );
+        $assert(
+            $sameOrgProjectedRead->eventId() === $sameOrgExpectedReadEventId
+                && $sameOrgProjectedRead->crossOrgAccessSnapshotId === null
+                && !array_key_exists(
+                    'cross_org_access_snapshot_id',
+                    (array) ($sameOrgProjectedPacket['data'] ?? []),
+                ),
+            'same-organization legacy conversation_read event and packet project without an epoch',
+        );
     } catch (Throwable $exception) {
         $assert(false, 'same-organization SEND remains available: ' . $exception->getMessage());
     }
@@ -1232,16 +1289,19 @@ foreach ([$orgA, $orgB] as $homeOrganization) {
     $assert((int) ($member['last_read_seq'] ?? 0) === 1, "read cursor mirrored to home {$homeOrganization}");
 }
 
-$conversationRead = (new ConversationSyncService(
+$conversationReadService = new ConversationSyncService(
     $repository,
     new OutboxService($repository, $config),
-))->markRead(
-    $context($orgA, $userA),
-    'client-' . $suffix . '-' . $userA,
+);
+$epochTwoOriginClientId = 'conversation-read-epoch-2-' . $suffix;
+$conversationRead = $conversationReadService->markRead(
+    $context($orgA, $userA, $epochTwoOriginClientId),
+    'conversation-read-connection-epoch-2-' . $suffix,
     $conversationId,
-    (string) $ack3['message']['message_id'],
+    (string) $ack2['message']['message_id'],
 );
 $assert(($conversationRead['user_organization'] ?? 0) === $orgA, 'conversation_read carries composite reader identity');
+$epochTwoEventIds = [];
 foreach ([$orgA, $orgB] as $homeOrganization) {
     $member = $repository->fetchOne(
         'SELECT last_read_seq FROM im_conversation_member
@@ -1249,13 +1309,51 @@ foreach ([$orgA, $orgB] as $homeOrganization) {
             AND member_organization = ? AND user_id = ?',
         [$homeOrganization, $conversationId, $orgA, $userA],
     );
-    $assert((int) ($member['last_read_seq'] ?? 0) === 3, "conversation_read cursor mirrored to home {$homeOrganization}");
+    $assert((int) ($member['last_read_seq'] ?? 0) === 2, "conversation_read cursor mirrored to home {$homeOrganization}");
     $readOutbox = $repository->fetchOne(
         'SELECT COUNT(*) AS aggregate FROM im_message_outbox
           WHERE organization = ? AND conversation_id = ? AND event_type = ?',
         [$homeOrganization, $conversationId, 'conversation.read'],
     );
     $assert((int) ($readOutbox['aggregate'] ?? 0) === 1, "conversation_read outbox written to home {$homeOrganization}");
+    $expectedEpochTwoEventId = hash(
+        'sha256',
+        $homeOrganization . '|' . Constants::MQ_ROUTING_CONVERSATION_READ . '|' . $conversationId
+            . '|' . $orgA . '|' . $userA . '|2|2',
+    );
+    $epochTwoEventIds[$homeOrganization] = $expectedEpochTwoEventId;
+    $epochTwoOutbox = $repository->fetchOne(
+        'SELECT event_id, payload_json FROM im_message_outbox WHERE event_id = ? LIMIT 1',
+        [$expectedEpochTwoEventId],
+    );
+    $epochTwoPayload = json_decode(
+        (string) ($epochTwoOutbox['payload_json'] ?? '{}'),
+        true,
+        flags: JSON_THROW_ON_ERROR,
+    );
+    $assert(
+        (string) ($epochTwoOutbox['event_id'] ?? '') === $expectedEpochTwoEventId
+            && ($epochTwoPayload['cross_org_access_snapshot_id'] ?? '') === '2'
+            && ($epochTwoPayload['origin_client_id'] ?? '') === $epochTwoOriginClientId,
+        "conversation_read epoch 2 key and origin are canonical in home {$homeOrganization}",
+    );
+}
+$conversationReadService->markRead(
+    $context($orgA, $userA, 'conversation-read-epoch-2-retry-' . $suffix),
+    'conversation-read-connection-epoch-2-retry-' . $suffix,
+    $conversationId,
+    (string) $ack2['message']['message_id'],
+);
+foreach ([$orgA, $orgB] as $homeOrganization) {
+    $epochTwoRetryCount = $repository->fetchOne(
+        'SELECT COUNT(*) AS aggregate FROM im_message_outbox
+          WHERE organization = ? AND conversation_id = ? AND event_type = ?',
+        [$homeOrganization, $conversationId, Constants::MQ_ROUTING_CONVERSATION_READ],
+    );
+    $assert(
+        (int) ($epochTwoRetryCount['aggregate'] ?? 0) === 1,
+        "conversation_read same-epoch retry from another connection is idempotent in home {$homeOrganization}",
+    );
 }
 
 $screenshotClientMsgId = 'screenshot-' . $suffix;
@@ -2037,6 +2135,77 @@ $friendAuthorizer->withCurrentRequest(
     },
 );
 $assert($restoredCurrentFriendDelivered, 'current restored friend epoch remains deliverable');
+
+$epochFourOriginClientId = 'conversation-read-epoch-4-' . $suffix;
+$epochFourRead = $conversationReadService->markRead(
+    $context($orgA, $userA, $epochFourOriginClientId),
+    'conversation-read-connection-epoch-4-' . $suffix,
+    $conversationId,
+    (string) $ack2['message']['message_id'],
+);
+$assert(
+    (int) ($epochFourRead['last_read_seq'] ?? 0) === (int) ($conversationRead['last_read_seq'] ?? 0)
+        && ($epochFourRead['cross_org_access_snapshot_id'] ?? '') === '4',
+    'conversation_read restored epoch advances identity without changing the read cursor',
+);
+foreach ([$orgA, $orgB] as $homeOrganization) {
+    $expectedEpochFourEventId = hash(
+        'sha256',
+        $homeOrganization . '|' . Constants::MQ_ROUTING_CONVERSATION_READ . '|' . $conversationId
+            . '|' . $orgA . '|' . $userA . '|2|4',
+    );
+    $epochFourOutbox = $repository->fetchOne(
+        'SELECT event_id, routing_key, payload_json FROM im_message_outbox WHERE event_id = ? LIMIT 1',
+        [$expectedEpochFourEventId],
+    );
+    $epochFourPayload = json_decode(
+        (string) ($epochFourOutbox['payload_json'] ?? '{}'),
+        true,
+        flags: JSON_THROW_ON_ERROR,
+    );
+    $epochFourCount = $repository->fetchOne(
+        'SELECT COUNT(*) AS aggregate FROM im_message_outbox
+          WHERE organization = ? AND conversation_id = ? AND event_type = ?',
+        [$homeOrganization, $conversationId, Constants::MQ_ROUTING_CONVERSATION_READ],
+    );
+    $assert(
+        (int) ($epochFourCount['aggregate'] ?? 0) === 2
+            && (string) ($epochFourOutbox['event_id'] ?? '') === $expectedEpochFourEventId
+            && $expectedEpochFourEventId !== $epochTwoEventIds[$homeOrganization],
+        "conversation_read epoch 4 creates one distinct same-sequence event in home {$homeOrganization}",
+    );
+    $assert(
+        ($epochFourPayload['origin_client_id'] ?? '') === $epochFourOriginClientId
+            && ($epochFourPayload['cross_org_access_snapshot_id'] ?? '') === '4',
+        "conversation_read epoch 4 preserves its current AuthContext origin in home {$homeOrganization}",
+    );
+    $epochFourProjected = (new RealtimeEventProjector())->project(
+        (string) ($epochFourOutbox['routing_key'] ?? ''),
+        json_encode($epochFourPayload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+    );
+    $assert(
+        $epochFourProjected->eventId() === $expectedEpochFourEventId
+            && $epochFourProjected->crossOrgAccessSnapshotId === '4',
+        "conversation_read epoch 4 realtime projection stays canonical in home {$homeOrganization}",
+    );
+}
+$conversationReadService->markRead(
+    $context($orgA, $userA, 'conversation-read-epoch-4-retry-' . $suffix),
+    'conversation-read-connection-epoch-4-retry-' . $suffix,
+    $conversationId,
+    (string) $ack2['message']['message_id'],
+);
+foreach ([$orgA, $orgB] as $homeOrganization) {
+    $epochFourRetryCount = $repository->fetchOne(
+        'SELECT COUNT(*) AS aggregate FROM im_message_outbox
+          WHERE organization = ? AND conversation_id = ? AND event_type = ?',
+        [$homeOrganization, $conversationId, Constants::MQ_ROUTING_CONVERSATION_READ],
+    );
+    $assert(
+        (int) ($epochFourRetryCount['aggregate'] ?? 0) === 2,
+        "conversation_read epoch 4 retry from another connection adds no row in home {$homeOrganization}",
+    );
+}
 
 $repository->execute('UPDATE sm_system_organization SET status = 0 WHERE id = ?', [$orgB]);
 $inactiveRealtimeIdentities = null;

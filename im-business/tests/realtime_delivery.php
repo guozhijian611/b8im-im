@@ -273,7 +273,11 @@ realtimeTest('receipt and conversation read events preserve composite actor iden
     realtimeAssert($receiptPacket['data']['cross_org_access_snapshot_id'] === '41');
 
     $readPayload = $base + [
-        'event_id' => hash('sha256', 'conversation-read-home-7'),
+        'event_id' => hash(
+            'sha256',
+            '7|' . Constants::MQ_ROUTING_CONVERSATION_READ
+                . '|single_2118193dd11825a86050c3575d1f9aa52849d5e3|8|reader-1|12|41',
+        ),
         'event_type' => Constants::MQ_ROUTING_CONVERSATION_READ,
         'user_organization' => 8,
         'user_id' => 'reader-1',
@@ -285,6 +289,7 @@ realtimeTest('receipt and conversation read events preserve composite actor iden
             'user_organization' => 8,
             'user_id' => 'reader-1',
             'time' => '2026-07-10 12:02:00',
+            'cross_org_access_snapshot_id' => '41',
         ],
     ];
     $read = (new RealtimeEventProjector())->project(
@@ -296,6 +301,154 @@ realtimeTest('receipt and conversation read events preserve composite actor iden
     realtimeAssert($read->crossOrgAccessSnapshotId === '41');
     $readPacket = json_decode($read->encodedPacket(), true, flags: JSON_THROW_ON_ERROR);
     realtimeAssert($readPacket['data']['cross_org_access_snapshot_id'] === '41');
+});
+
+realtimeTest('conversation read epoch identity is stable and isolates delivery checkpoints', static function (): void {
+    $conversationId = 'single_2118193dd11825a86050c3575d1f9aa52849d5e3';
+    $messageId = '01JZMESSAGE00000000000000001';
+    $payload = [
+        'event_id' => hash(
+            'sha256',
+            '7|' . Constants::MQ_ROUTING_CONVERSATION_READ . '|' . $conversationId . '|8|reader-1|12|41',
+        ),
+        'event_type' => Constants::MQ_ROUTING_CONVERSATION_READ,
+        'organization' => 7,
+        'conversation_id' => $conversationId,
+        'conversation_type' => 1,
+        'message_id' => $messageId,
+        'message_seq' => 12,
+        'change_seq' => 0,
+        'actor_organization' => 8,
+        'actor_user_id' => 'reader-1',
+        'origin_organization' => 8,
+        'origin_user_id' => 'reader-1',
+        'origin_client_id' => 'reader-epoch-41',
+        'cross_org_access_snapshot_id' => '41',
+        'user_organization' => 8,
+        'user_id' => 'reader-1',
+        'recipient_count' => 1,
+        'recipient_identities' => [['organization' => 7, 'user_id' => 'sender-1']],
+        'read_state' => [
+            'conversation_id' => $conversationId,
+            'last_read_message_id' => $messageId,
+            'last_read_seq' => 12,
+            'unread_count' => 0,
+            'user_organization' => 8,
+            'user_id' => 'reader-1',
+            'time' => '2026-07-10 12:02:00',
+            'cross_org_access_snapshot_id' => '41',
+        ],
+        'created_at' => '2026-07-10 12:02:00',
+    ];
+    $projector = new RealtimeEventProjector();
+    $epochFortyOne = $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($payload, JSON_THROW_ON_ERROR),
+    );
+    $sameEpochRetryPayload = $payload;
+    $sameEpochRetryPayload['origin_client_id'] = 'reader-epoch-41-retry';
+    $sameEpochRetry = $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($sameEpochRetryPayload, JSON_THROW_ON_ERROR),
+    );
+    realtimeAssert(
+        $sameEpochRetry->eventId() === $epochFortyOne->eventId()
+            && $sameEpochRetry->originClientId === 'reader-epoch-41-retry',
+        'origin client must remain payload data outside the stable event identity',
+    );
+
+    $mismatchedPayload = $payload;
+    $mismatchedPayload['cross_org_access_snapshot_id'] = '43';
+    $mismatchedPayload['read_state']['cross_org_access_snapshot_id'] = '43';
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($mismatchedPayload, JSON_THROW_ON_ERROR),
+    ));
+
+    $sameOrganizationPayload = $payload;
+    unset($sameOrganizationPayload['cross_org_access_snapshot_id']);
+    unset($sameOrganizationPayload['read_state']['cross_org_access_snapshot_id']);
+    $sameOrganizationPayload['actor_organization'] = 7;
+    $sameOrganizationPayload['origin_organization'] = 7;
+    $sameOrganizationPayload['user_organization'] = 7;
+    $sameOrganizationPayload['read_state']['user_organization'] = 7;
+    $sameOrganizationPayload['event_id'] = hash(
+        'sha256',
+        '7|' . Constants::MQ_ROUTING_CONVERSATION_READ . '|' . $conversationId . '|7|reader-1|12',
+    );
+    $sameOrganizationEvent = $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($sameOrganizationPayload, JSON_THROW_ON_ERROR),
+    );
+    realtimeAssert(
+        $sameOrganizationEvent->eventId() === $sameOrganizationPayload['event_id']
+            && $sameOrganizationEvent->crossOrgAccessSnapshotId === null,
+        'snapshot-free conversation.read keeps the legacy identity formula',
+    );
+    $sameOrganizationSnapshotLeak = $sameOrganizationPayload;
+    $sameOrganizationSnapshotLeak['read_state']['cross_org_access_snapshot_id'] = '41';
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($sameOrganizationSnapshotLeak, JSON_THROW_ON_ERROR),
+    ));
+
+    $epochFortyThreePayload = $payload;
+    $epochFortyThreePayload['event_id'] = hash(
+        'sha256',
+        '7|' . Constants::MQ_ROUTING_CONVERSATION_READ . '|' . $conversationId . '|8|reader-1|12|43',
+    );
+    $epochFortyThreePayload['origin_client_id'] = 'reader-epoch-43';
+    $epochFortyThreePayload['cross_org_access_snapshot_id'] = '43';
+    $epochFortyThreePayload['read_state']['cross_org_access_snapshot_id'] = '43';
+    $epochFortyThree = $projector->project(
+        Constants::MQ_ROUTING_CONVERSATION_READ,
+        json_encode($epochFortyThreePayload, JSON_THROW_ON_ERROR),
+    );
+    realtimeAssert($epochFortyThree->eventId() !== $epochFortyOne->eventId());
+
+    $provider = new class() implements RealtimeRecipientProvider {
+        use PassThroughRealtimeRecipientBoundary;
+
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array
+        {
+            return [['organization' => 7, 'user_id' => 'sender-1']];
+        }
+    };
+    $gateway = new class() implements RealtimeGateway {
+        public array $eventIds = [];
+
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array
+        {
+            return ['sender-client'];
+        }
+
+        public function sendToClient(string $clientId, string $packet): void
+        {
+            $decoded = json_decode($packet, true, flags: JSON_THROW_ON_ERROR);
+            $this->eventIds[] = (string) $decoded['data']['event_id'];
+        }
+    };
+    $checkpoints = new class() implements RealtimeDeliveryCheckpoint {
+        public array $delivered = [];
+
+        public function wasDelivered(RealtimeEvent $event, string $clientId): bool
+        {
+            return isset($this->delivered[$event->eventId() . ':' . $clientId]);
+        }
+
+        public function markDelivered(RealtimeEvent $event, string $clientId): void
+        {
+            $this->delivered[$event->eventId() . ':' . $clientId] = true;
+        }
+    };
+    $delivery = new RealtimeDeliveryService($provider, $gateway, $checkpoints);
+    $delivery->deliver($epochFortyOne);
+    $delivery->deliver($epochFortyOne);
+    $delivery->deliver($epochFortyThree);
+    $delivery->deliver($epochFortyThree);
+
+    realtimeAssert($gateway->eventIds === [$epochFortyOne->eventId(), $epochFortyThree->eventId()]);
+    realtimeAssert(count($checkpoints->delivered) === 2);
 });
 
 realtimeTest('conversation access changes project both allowed states without member-policy gating', static function (): void {

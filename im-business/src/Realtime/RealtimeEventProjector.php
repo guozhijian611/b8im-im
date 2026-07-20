@@ -497,6 +497,25 @@ final class RealtimeEventProjector
         ) {
             throw new InvalidRealtimeEvent('conversation.read identity or cursor mismatch');
         }
+        if (
+            $this->optionalPositiveDecimal($readState, 'cross_org_access_snapshot_id')
+            !== $crossOrgAccessSnapshotId
+        ) {
+            throw new InvalidRealtimeEvent('conversation.read access snapshot mismatch');
+        }
+        if (!hash_equals(
+            ConversationReadEventId::generate(
+                $organization,
+                $conversationId,
+                $userOrganization,
+                $userId,
+                $messageSeq,
+                $crossOrgAccessSnapshotId,
+            ),
+            $eventId,
+        )) {
+            throw new InvalidRealtimeEvent('conversation.read event_id differs from its canonical identity');
+        }
 
         return $this->event(
             eventId: $eventId,

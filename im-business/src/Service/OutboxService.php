@@ -10,6 +10,7 @@ namespace B8im\ImBusiness\Service;
 
 use B8im\ImBusiness\Auth\AuthContext;
 use B8im\ImBusiness\Config;
+use B8im\ImBusiness\Realtime\ConversationReadEventId;
 use B8im\ImBusiness\Repository\ImRepository;
 use B8im\ImShared\Support\Constants;
 use B8im\ImBusiness\Telemetry\Telemetry;
@@ -207,14 +208,14 @@ final class OutboxService
         array $recipientIdentities,
         ?string $crossOrgAccessSnapshotId = null,
     ): void {
-        $eventId = $this->eventId([
+        $eventId = ConversationReadEventId::generate(
             $homeOrganization,
-            Constants::MQ_ROUTING_CONVERSATION_READ,
             (string) $readState['conversation_id'],
             $context->organization,
             $context->userId,
             (int) $readState['last_read_seq'],
-        ]);
+            $crossOrgAccessSnapshotId,
+        );
         $payload = [
             'event_id' => $eventId,
             'event_type' => Constants::MQ_ROUTING_CONVERSATION_READ,
