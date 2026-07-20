@@ -12,7 +12,7 @@
             "dist": {
                 "type": "path",
                 "url": "../../b8im-im-shared",
-                "reference": "170b329f8733e5fac529306982add1334ab5d539"
+                "reference": "3ed922c7b8d7359aed3443ae87e5b0f29b09fe88"
             },
             "require": {
                 "php": ">=8.1"
@@ -25,7 +25,7 @@
             },
             "scripts": {
                 "test": [
-                    "php tests/run.php"
+                    "php tests/run.php && php tests/message_shard_identity_test.php"
                 ],
                 "lint": [
                     "find src tests -name '*.php' -print0 | xargs -0 -n1 php -l"
