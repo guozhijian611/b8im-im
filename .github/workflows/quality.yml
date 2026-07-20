@@ -23,6 +23,8 @@ jobs:
       REDIS_DB: 0
       IM_EXPECT_DATABASE: nb8im_cross_org_ci
       IM_MESSAGE_SHARD_BUCKETS: 64
+      IM_TOKEN_SECRET: ci-group-access-token-secret-20260720-minimum-32-bytes
+      IM_GROUP_ACCESS_MIGRATION_MYSQL_TEST: 1
     services:
       mysql:
         image: mysql:8.0
