@@ -28,6 +28,61 @@ use B8im\ImShared\Support\Constants;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
+/**
+ * The isolated integration suite runs without Gateway/Register processes.
+ * Keep an in-process probe at the static Gateway seam so typing authorization
+ * can prove both "no relay" failures and successful one-/two-home handoffs.
+ */
+final class TypingGatewayProbe
+{
+    /** @var array<string,list<string>> */
+    public static array $clientIdsByUid = [];
+
+    /** @var list<array{method:string,target:string,payload?:string}> */
+    public static array $calls = [];
+
+    /** @param array<string,list<string>> $clientIdsByUid */
+    public static function reset(array $clientIdsByUid = []): void
+    {
+        self::$clientIdsByUid = $clientIdsByUid;
+        self::$calls = [];
+    }
+
+    /** @return list<string> */
+    public static function getClientIdByUid(mixed $uid): array
+    {
+        $uid = (string) $uid;
+        self::$calls[] = ['method' => 'getClientIdByUid', 'target' => $uid];
+
+        return self::$clientIdsByUid[$uid] ?? [];
+    }
+
+    public static function sendToClient(mixed $clientId, mixed $payload): void
+    {
+        self::$calls[] = [
+            'method' => 'sendToClient',
+            'target' => (string) $clientId,
+            'payload' => (string) $payload,
+        ];
+    }
+
+    public static function sendToUid(mixed $uid, mixed $payload): void
+    {
+        self::$calls[] = [
+            'method' => 'sendToUid',
+            'target' => (string) $uid,
+            'payload' => (string) $payload,
+        ];
+    }
+}
+
+if (
+    class_exists(GatewayWorker\Lib\Gateway::class, false)
+    || !class_alias(TypingGatewayProbe::class, GatewayWorker\Lib\Gateway::class)
+) {
+    throw new RuntimeException('unable to install isolated typing Gateway probe');
+}
+
 if (is_file(dirname(__DIR__) . '/.env')) {
     Dotenv\Dotenv::createImmutable(dirname(__DIR__))->safeLoad();
 }
@@ -713,6 +768,334 @@ $ack3 = $messages->send(
     $sendPacket($orgA, $userA, 'on-reverse-' . $suffix),
 );
 $assert((string) $ack3['message']['conversation_id'] === $conversationId, 'reverse send uses same conversation');
+
+$assertTypingPolicyFailure = static function (
+    AuthContext $actor,
+    string $label,
+) use ($repository, $conversationId, $assert): void {
+    TypingGatewayProbe::reset();
+    try {
+        (new TypingService($repository))->relay(
+            $actor,
+            $actor->clientId,
+            ['conversation_id' => $conversationId],
+        );
+        $assert(false, "{$label} must reject typing");
+    } catch (ImException $exception) {
+        $assert(
+            $exception->errorCode() === 'TENANT_POLICY_FORBIDDEN',
+            "{$label} fails closed with tenant-policy code",
+        );
+    }
+    $assert(
+        TypingGatewayProbe::$calls === [],
+        "{$label} rejects before any Gateway relay lookup or send",
+    );
+};
+
+// Either durable home can revoke transient typing. Every failure must happen
+// before the static Gateway seam is touched.
+$repository->execute(
+    'UPDATE sm_tenant_im_policy
+        SET status = "DISABLED", version = version + 1
+      WHERE organization = ?',
+    [$orgB],
+);
+try {
+    $assertTypingPolicyFailure(
+        $context($orgA, $userA),
+        'A-to-B typing with disabled peer policy',
+    );
+} finally {
+    $repository->execute(
+        'UPDATE sm_tenant_im_policy
+            SET status = "ENABLED", version = version + 1
+          WHERE organization = ?',
+        [$orgB],
+    );
+}
+
+$repository->execute(
+    'DELETE FROM sm_tenant_im_policy WHERE organization = ?',
+    [$orgB],
+);
+try {
+    $assertTypingPolicyFailure(
+        $context($orgA, $userA),
+        'A-to-B typing with missing peer policy',
+    );
+
+    // A one-home conversation must not start depending on an unrelated
+    // organization's missing policy.
+    $sameOrgActor = $context($orgA, $userA);
+    $sameOrgOtherClient = 'typing-other-' . $suffix;
+    TypingGatewayProbe::reset([
+        $sameOrgActor->uid() => [$sameOrgActor->clientId, $sameOrgOtherClient],
+    ]);
+    try {
+        (new TypingService($repository))->relay(
+            $sameOrgActor,
+            $sameOrgActor->clientId,
+            ['conversation_id' => $sameOrgConversationId],
+        );
+        $sameOrgOtherDeviceRelays = array_values(array_filter(
+            TypingGatewayProbe::$calls,
+            static fn (array $call): bool =>
+                $call['method'] === 'sendToClient'
+                && $call['target'] === $sameOrgOtherClient,
+        ));
+        $sameOrgPeerRelays = array_values(array_filter(
+            TypingGatewayProbe::$calls,
+            static fn (array $call): bool =>
+                $call['method'] === 'sendToUid'
+                && $call['target'] === AuthContext::uidFor($orgA, $sameOrgPeer),
+        ));
+        $assert(
+            count($sameOrgOtherDeviceRelays) === 1
+                && count($sameOrgPeerRelays) === 1,
+            'same-organization typing relays normally while unrelated peer policy is missing',
+        );
+    } catch (Throwable $exception) {
+        $assert(false, 'same-organization typing remains available: ' . $exception->getMessage());
+    }
+} finally {
+    $repository->execute(
+        'INSERT INTO sm_tenant_im_policy
+            (organization, allowed_client_families_json, allow_multi_device_online,
+             max_online_devices, same_device_login_policy, cross_device_login_policy,
+             max_message_concurrency, max_message_qps, default_group_display_member_count,
+             message_recall_window_seconds, message_edit_window_seconds,
+             recall_notice_enabled, group_recall_notice_enabled, status, version,
+             create_time, update_time)
+         VALUES
+            (?, ?, 1, 5, "replace", "allow", 8, 20, 50, 120, 120, 1, 1,
+             "ENABLED", 1, ?, ?)',
+        [$orgB, '["web","app","desktop"]', $now, $now],
+    );
+}
+
+$repository->execute(
+    'UPDATE sm_tenant_im_policy
+        SET allowed_client_families_json = ?, version = version + 1
+      WHERE organization = ?',
+    ['[]', $orgB],
+);
+try {
+    $assertTypingPolicyFailure(
+        $context($orgA, $userA),
+        'A-to-B typing with invalid peer policy',
+    );
+} finally {
+    $repository->execute(
+        'UPDATE sm_tenant_im_policy
+            SET allowed_client_families_json = ?, version = version + 1
+          WHERE organization = ?',
+        ['["web","app","desktop"]', $orgB],
+    );
+}
+
+/**
+ * Hold policy 10, then start real TypingService in the requested direction.
+ * A blocked update of policy 2 proves the child acquired the numeric-lower
+ * tenant policy first. Releasing policy 10 must let it relay and exit without
+ * a deadlock in both directions.
+ */
+$probeTypingPolicyLockOrder = static function (
+    AuthContext $actor,
+    string $direction,
+) use (
+    $repository,
+    $config,
+    $blockedUpdate,
+    $assert,
+    $orgA,
+    $orgB,
+    $conversationId,
+): void {
+    $child = <<<'PHP'
+final class TypingChildGateway
+{
+    public static int $relays = 0;
+
+    public static function getClientIdByUid(mixed $uid): array
+    {
+        return [];
+    }
+
+    public static function sendToClient(mixed $clientId, mixed $payload): void
+    {
+        self::$relays++;
+    }
+
+    public static function sendToUid(mixed $uid, mixed $payload): void
+    {
+        self::$relays++;
+    }
+}
+
+require $argv[1];
+if (!class_alias(TypingChildGateway::class, 'GatewayWorker\\Lib\\Gateway')) {
+    fwrite(STDERR, 'unable to install child Gateway probe');
+    exit(4);
+}
+foreach ([
+    'DB_HOST' => $argv[2],
+    'DB_PORT' => $argv[3],
+    'DB_NAME' => $argv[4],
+    'DB_USER' => $argv[5],
+    'DB_PASSWORD' => $argv[6],
+    'DB_CHARSET' => $argv[7],
+] as $key => $value) {
+    putenv($key . '=' . $value);
+    $_ENV[$key] = $value;
+    $_SERVER[$key] = $value;
+}
+$data = json_decode(base64_decode($argv[8], true), true, flags: JSON_THROW_ON_ERROR);
+$config = \B8im\ImBusiness\Config::fromEnv();
+$repository = \B8im\ImBusiness\Repository\ImRepository::connect($config);
+$context = \B8im\ImBusiness\Auth\AuthContext::fromArray($data);
+fwrite(STDOUT, "STARTED\n");
+fflush(STDOUT);
+try {
+    (new \B8im\ImBusiness\Service\TypingService($repository))->relay(
+        $context,
+        $context->clientId,
+        ['conversation_id' => (string) $data['conversation_id']],
+    );
+} catch (\Throwable $exception) {
+    fwrite(STDERR, get_class($exception) . ':' . $exception->getMessage());
+    exit(3);
+}
+fwrite(STDOUT, 'RELAYED:' . TypingChildGateway::$relays);
+PHP;
+    $autoload = dirname(__DIR__) . '/vendor/autoload.php';
+    $childData = $actor->toArray();
+    $childData['conversation_id'] = $conversationId;
+    $process = null;
+    $pipes = [];
+
+    try {
+        $repository->transaction(function () use (
+            $repository,
+            $config,
+            $blockedUpdate,
+            $assert,
+            $orgA,
+            $orgB,
+            $direction,
+            $child,
+            $autoload,
+            $childData,
+            &$process,
+            &$pipes,
+        ): void {
+            $policyTen = $repository->fetchOne(
+                'SELECT organization
+                   FROM sm_tenant_im_policy
+                  WHERE organization = ?
+                  LIMIT 1 FOR UPDATE',
+                [$orgB],
+            );
+            if ($policyTen === null) {
+                throw new RuntimeException('policy 10 is missing before typing lock-order probe');
+            }
+
+            $process = proc_open(
+                [
+                    PHP_BINARY,
+                    '-r',
+                    $child,
+                    $autoload,
+                    $config->dbHost,
+                    (string) $config->dbPort,
+                    $config->dbName,
+                    $config->dbUser,
+                    $config->dbPassword,
+                    $config->dbCharset,
+                    base64_encode(json_encode($childData, JSON_THROW_ON_ERROR)),
+                ],
+                [
+                    0 => ['pipe', 'r'],
+                    1 => ['pipe', 'w'],
+                    2 => ['pipe', 'w'],
+                ],
+                $pipes,
+            );
+            if (!is_resource($process)) {
+                throw new RuntimeException('unable to start typing lock-order probe');
+            }
+            fclose($pipes[0]);
+            unset($pipes[0]);
+            $ready = fgets($pipes[1]);
+            if ($ready !== "STARTED\n") {
+                throw new RuntimeException("{$direction} typing child did not start");
+            }
+
+            $lowerPolicyLocked = false;
+            $deadline = microtime(true) + 5.0;
+            do {
+                $lowerPolicyLocked = $blockedUpdate(
+                    'UPDATE sm_tenant_im_policy
+                        SET version = version
+                      WHERE organization = ?',
+                    [$orgA],
+                );
+                if ($lowerPolicyLocked) {
+                    break;
+                }
+                usleep(50_000);
+            } while (microtime(true) < $deadline);
+
+            $status = proc_get_status($process);
+            $assert(
+                $lowerPolicyLocked && ($status['running'] ?? false),
+                "{$direction} typing locks policy 2 before waiting on policy 10",
+            );
+            stream_set_blocking($pipes[1], false);
+            $assert(
+                (string) stream_get_contents($pipes[1]) === '',
+                "{$direction} typing emits no relay before the held policy update commits",
+            );
+            stream_set_blocking($pipes[1], true);
+        });
+
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        unset($pipes[1], $pipes[2]);
+        $exitCode = proc_close($process);
+        $process = null;
+        $assert(
+            $exitCode === 0 && trim((string) $stdout) === 'RELAYED:1',
+            "{$direction} typing resumes after policy commit without deadlock or duplicate relay"
+                . ($stderr === '' ? '' : ': ' . $stderr),
+        );
+    } finally {
+        foreach ($pipes as $pipe) {
+            if (is_resource($pipe)) {
+                fclose($pipe);
+            }
+        }
+        if (is_resource($process)) {
+            $status = proc_get_status($process);
+            if ($status['running'] ?? false) {
+                proc_terminate($process);
+            }
+            proc_close($process);
+        }
+    }
+};
+
+$probeTypingPolicyLockOrder(
+    $context($orgA, $userA),
+    'A-to-B',
+);
+$probeTypingPolicyLockOrder(
+    $context($orgB, $userB),
+    'B-to-A',
+);
+
 $originSequences = array_map(
     static fn (array $row): int => (int) $row['message_seq'],
     $repository->fetchAll(
