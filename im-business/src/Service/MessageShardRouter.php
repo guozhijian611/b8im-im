@@ -10,6 +10,7 @@ namespace B8im\ImBusiness\Service;
 
 use B8im\ImBusiness\Repository\MessageShardRepositoryInterface;
 use B8im\ImBusiness\Exception\ImException;
+use B8im\ImShared\Support\MessageShardIdentity;
 use InvalidArgumentException;
 
 final class MessageShardRouter
@@ -51,14 +52,18 @@ final class MessageShardRouter
     public function __construct(
         private readonly MessageShardRepositoryInterface $repository,
         private readonly int $bucketCount,
-    )
-    {
+    ) {
+        MessageShardIdentity::assertValidBucketCount($bucketCount);
     }
 
     public function writeTable(int $organization, string $conversationId, string $time): string
     {
-        $timestamp = strtotime($time) ?: time();
-        $table = sprintf('%s_%04d_%s', self::BASE_TABLE, $this->bucket($organization, $conversationId), date('Ym', $timestamp));
+        $table = MessageShardIdentity::tableName(
+            $organization,
+            $conversationId,
+            $time,
+            $this->bucketCount,
+        );
         $this->assertTableExists($table);
 
         return $table;
@@ -66,7 +71,7 @@ final class MessageShardRouter
 
     public function tablesForConversationNewestFirst(int $organization, string $conversationId): array
     {
-        $bucket = $this->bucket($organization, $conversationId);
+        $bucket = MessageShardIdentity::bucket($organization, $conversationId, $this->bucketCount);
         $cacheKey = 'bucket:' . $bucket;
         if (isset($this->tableCache[$cacheKey])) {
             return $this->tableCache[$cacheKey];
@@ -205,8 +210,4 @@ final class MessageShardRouter
         return $table === self::BASE_TABLE || preg_match('/^im_message_\d{4}_\d{6}$/', $table) === 1;
     }
 
-    private function bucket(int $organization, string $conversationId): int
-    {
-        return abs(crc32($organization . ':' . $conversationId)) % $this->bucketCount;
-    }
 }
