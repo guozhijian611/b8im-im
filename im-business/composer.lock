@@ -12,7 +12,7 @@
             "dist": {
                 "type": "path",
                 "url": "../../b8im-im-shared",
-                "reference": "e7cd3e053e2b6032811425f58a541452d49a3a0c"
+                "reference": "9c5d9d3626ce29eb079716f8ce425cd32c2f27f6"
             },
             "require": {
                 "php": ">=8.1"

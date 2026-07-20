@@ -6,6 +6,7 @@ use B8im\ImBusiness\Service\RealtimeEventConsumer;
 use B8im\ImBusiness\Service\RealtimeEventClaim;
 use B8im\ImBusiness\Service\RealtimeEventGatewayInterface;
 use B8im\ImBusiness\Service\RealtimeEventStoreInterface;
+use B8im\ImBusiness\Service\FriendRequestRealtimeAuthorizerInterface;
 use B8im\ImBusiness\Service\RedisRealtimeEventStore;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
@@ -22,6 +23,40 @@ function controlAssert(bool $condition, string $message = 'assertion failed'): v
 {
     if (!$condition) {
         throw new RuntimeException($message);
+    }
+}
+
+final class ControlFriendRequestAuthorizer implements FriendRequestRealtimeAuthorizerInterface
+{
+    /** @var list<array<string,int|string|null>> */
+    public array $calls = [];
+
+    public function __construct(public bool $deliver)
+    {
+    }
+
+    public function withCurrentRequest(
+        int $eventOrganization,
+        int $requestId,
+        int $fromOrganization,
+        string $fromUserId,
+        int $toOrganization,
+        string $toUserId,
+        ?string $crossOrgAccessSnapshotId,
+        callable $delivery,
+    ): void {
+        $this->calls[] = [
+            'event_organization' => $eventOrganization,
+            'request_id' => $requestId,
+            'from_organization' => $fromOrganization,
+            'from_user_id' => $fromUserId,
+            'to_organization' => $toOrganization,
+            'to_user_id' => $toUserId,
+            'cross_org_access_snapshot_id' => $crossOrgAccessSnapshotId,
+        ];
+        if ($this->deliver) {
+            $delivery();
+        }
     }
 }
 
@@ -642,7 +677,9 @@ controlTest('friend requests retain their control-plane realtime behavior', stat
     $gateway = new ControlTestGateway();
     $store->queue[] = controlEnvelope('friend_request.created', 7, [
         'request_id' => 88,
+        'from_organization' => 7,
         'from_user_id' => 'user-1',
+        'to_organization' => 7,
         'to_user_id' => 'user-2',
         'message' => 'hello',
         'pending_count' => 1,
@@ -653,10 +690,92 @@ controlTest('friend requests retain their control-plane realtime behavior', stat
     controlAssert(count($gateway->sent) === 1);
     controlAssert($gateway->sent[0][0] === 7 && $gateway->sent[0][1] === 'user-2');
     controlAssert($gateway->sent[0][2]['cmd'] === 'friend_request');
+    controlAssert($gateway->sent[0][2]['data']['from_organization'] === 7);
+    controlAssert($gateway->sent[0][2]['data']['to_organization'] === 7);
+    controlAssert(!array_key_exists('cross_org_access_snapshot_id', $gateway->sent[0][2]['data']));
     controlAssert(
         $gateway->sent[0][2]['data']['event_id'] === json_decode($store->acked[0], true, flags: JSON_THROW_ON_ERROR)['event_id'],
         'friend request packet must carry the stable control event id',
     );
+});
+
+controlTest('stale cross-organization friend request converges without delivery or retry', static function (): void {
+    $store = new ControlTestStore();
+    $gateway = new ControlTestGateway();
+    $authorizer = new ControlFriendRequestAuthorizer(false);
+    $store->queue[] = controlEnvelope('friend_request.created', 8, [
+        'cross_org_access_snapshot_id' => '41',
+        'request_id' => 89,
+        'from_organization' => 7,
+        'from_user_id' => 'user-1',
+        'to_organization' => 8,
+        'to_user_id' => 'user-2',
+        'message' => 'old request',
+        'pending_count' => 1,
+        'create_time' => '2026-07-10 14:03:00',
+    ]);
+
+    (new RealtimeEventConsumer(
+        $store,
+        $gateway,
+        friendRequestAuthorizer: $authorizer,
+    ))->consume();
+
+    controlAssert(count($authorizer->calls) === 1);
+    controlAssert($authorizer->calls[0]['cross_org_access_snapshot_id'] === '41');
+    controlAssert($gateway->sent === []);
+    controlAssert(count($store->acked) === 1 && $store->requeued === [] && $store->processing === []);
+});
+
+controlTest('current cross-organization friend request is sent inside authorization callback', static function (): void {
+    $store = new ControlTestStore();
+    $gateway = new ControlTestGateway();
+    $authorizer = new ControlFriendRequestAuthorizer(true);
+    $store->queue[] = controlEnvelope('friend_request.created', 8, [
+        'cross_org_access_snapshot_id' => '42',
+        'request_id' => 90,
+        'from_organization' => 7,
+        'from_user_id' => 'user-1',
+        'to_organization' => 8,
+        'to_user_id' => 'user-2',
+        'message' => 'current request',
+        'pending_count' => 1,
+        'create_time' => '2026-07-10 14:04:00',
+    ]);
+
+    (new RealtimeEventConsumer(
+        $store,
+        $gateway,
+        friendRequestAuthorizer: $authorizer,
+    ))->consume();
+
+    controlAssert(count($gateway->sent) === 1);
+    controlAssert($gateway->sent[0][0] === 8 && $gateway->sent[0][1] === 'user-2');
+    controlAssert($gateway->sent[0][2]['data']['cross_org_access_snapshot_id'] === '42');
+    controlAssert($gateway->sent[0][2]['data']['message'] === 'current request');
+    controlAssert(count($store->acked) === 1 && $store->requeued === []);
+});
+
+controlTest('cross-organization friend request without epoch fails closed', static function (): void {
+    $store = new ControlTestStore();
+    $gateway = new ControlTestGateway();
+    $authorizer = new ControlFriendRequestAuthorizer(true);
+    $store->queue[] = controlEnvelope('friend_request.created', 8, [
+        'request_id' => 91,
+        'from_organization' => 7,
+        'from_user_id' => 'user-1',
+        'to_organization' => 8,
+        'to_user_id' => 'user-2',
+    ]);
+
+    (new RealtimeEventConsumer(
+        $store,
+        $gateway,
+        friendRequestAuthorizer: $authorizer,
+    ))->consume();
+
+    controlAssert($authorizer->calls === [] && $gateway->sent === []);
+    controlAssert(count($store->acked) === 1 && $store->requeued === []);
 });
 
 controlTest('organization inactive marker is bounded and enable clears it', static function (): void {

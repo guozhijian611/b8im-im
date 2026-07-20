@@ -9,6 +9,8 @@ use B8im\ImBusiness\Auth\TokenPolicy;
 use B8im\ImBusiness\CmdDispatcher;
 use B8im\ImBusiness\Connection\ConnectionStore;
 use B8im\ImBusiness\Exception\ImException;
+use B8im\ImBusiness\Events;
+use B8im\ImBusiness\Service\MessageService;
 use B8im\ImShared\Protocol\CmdHandlerInterface;
 use B8im\ImShared\Protocol\Command;
 use B8im\ImShared\Protocol\Packet;
@@ -199,6 +201,219 @@ test('module dispatch replaces untrusted packet organization', static function (
 
     assertTrue($handler->seenOrganization === 7, 'handler received client organization');
     assertTrue($guardOrganization === 7, 'license guard received client organization');
+});
+
+test('SYNC requires and echoes only a top-level client_msg_id', static function (): void {
+    $validator = new ReflectionMethod(Events::class, 'requireTopLevelClientMsgId');
+    $validator->setAccessible(true);
+    $valid = new Packet(
+        Command::SYNC,
+        ['client_msg_id' => 'nested-must-not-be-used', 'after_global_seq' => '0'],
+        999,
+        'sync-request-1',
+    );
+    assertTrue($validator->invoke(null, $valid, 'SYNC') === 'sync-request-1');
+
+    foreach ([
+        new Packet(Command::SYNC, ['client_msg_id' => 'nested-only']),
+        new Packet(Command::SYNC, [], clientMsgId: ''),
+        new Packet(Command::SYNC, [], clientMsgId: ' padded '),
+        new Packet(Command::SYNC, [], clientMsgId: str_repeat('s', 81)),
+        new Packet(Command::SYNC, [], clientMsgId: "sync\0invalid"),
+    ] as $invalid) {
+        expectImCode(
+            'SYNC_CLIENT_MSG_ID_INVALID',
+            static fn () => $validator->invoke(null, $invalid, 'SYNC'),
+        );
+    }
+
+    $responseFactory = new ReflectionMethod(Events::class, 'responsePacket');
+    $responseFactory->setAccessible(true);
+    foreach ([Command::SYNC_ACK, Command::ERROR] as $command) {
+        $response = $responseFactory->invoke(
+            null,
+            $command,
+            ['scope' => 'global'],
+            7,
+            'sync-request-1',
+        );
+        assertTrue($response instanceof Packet);
+        $encoded = json_decode($response->encode(), true, flags: JSON_THROW_ON_ERROR);
+        assertTrue($encoded['client_msg_id'] === 'sync-request-1');
+        assertTrue(!array_key_exists('client_msg_id', $encoded['data']));
+    }
+
+    $source = (string) file_get_contents(dirname(__DIR__) . '/src/Events.php');
+    assertTrue(preg_match(
+        '/private static function handleSync\\b.*?(?=\\n    private static function )/s',
+        $source,
+        $match,
+    ) === 1);
+    assertTrue(str_contains($match[0], "unset(\$data['client_msg_id'])"));
+    assertTrue(!str_contains($match[0], 'self::requestData($packet)'));
+});
+
+test('durable mutations and conversation read require exact top-level request ids', static function (): void {
+    $validator = new ReflectionMethod(Events::class, 'requireTopLevelClientMsgId');
+    $validator->setAccessible(true);
+    $requestData = new ReflectionMethod(Events::class, 'requestData');
+    $requestData->setAccessible(true);
+    $responseFactory = new ReflectionMethod(Events::class, 'responsePacket');
+    $responseFactory->setAccessible(true);
+    $eventsSource = (string) file_get_contents(dirname(__DIR__) . '/src/Events.php');
+
+    $operations = [
+        'ACK' => ['handleAck', Command::ACK_ACK],
+        'CONVERSATION_READ' => ['handleConversationRead', Command::CONVERSATION_READ_ACK],
+        'RECALL' => ['handleRecall', Command::RECALL_ACK],
+        'EDIT' => ['handleEdit', Command::EDIT_ACK],
+        'DELETE' => ['handleDelete', Command::DELETE_ACK],
+        'SCREENSHOT' => ['handleScreenshot', Command::SCREENSHOT_ACK],
+    ];
+    foreach ($operations as $operation => [$handler, $ackCommand]) {
+        $requestId = strtolower($operation) . '-request-1';
+        $valid = new Packet(
+            strtolower($operation),
+            ['client_msg_id' => 'nested-must-not-be-used', 'resource_id' => 'resource-1'],
+            999,
+            $requestId,
+        );
+        assertTrue($validator->invoke(null, $valid, $operation) === $requestId);
+        assertTrue(
+            $requestData->invoke(null, $valid, $requestId) === [
+                'resource_id' => 'resource-1',
+                'client_msg_id' => $requestId,
+            ],
+            $operation . ' reused nested client_msg_id',
+        );
+
+        foreach ([
+            new Packet(strtolower($operation), ['client_msg_id' => 'nested-only']),
+            new Packet(strtolower($operation), [], clientMsgId: ''),
+            new Packet(strtolower($operation), [], clientMsgId: ' padded '),
+            new Packet(strtolower($operation), [], clientMsgId: str_repeat('x', 81)),
+            new Packet(strtolower($operation), [], clientMsgId: "request\0invalid"),
+        ] as $invalid) {
+            expectImCode(
+                $operation . '_CLIENT_MSG_ID_INVALID',
+                static fn () => $validator->invoke(null, $invalid, $operation),
+            );
+        }
+
+        foreach ([$ackCommand, Command::ERROR] as $responseCommand) {
+            $response = $responseFactory->invoke(
+                null,
+                $responseCommand,
+                ['ok' => $responseCommand !== Command::ERROR],
+                7,
+                $requestId,
+            );
+            $encoded = json_decode($response->encode(), true, flags: JSON_THROW_ON_ERROR);
+            assertTrue($encoded['client_msg_id'] === $requestId);
+        }
+
+        assertTrue(preg_match(
+            '/private static function ' . $handler . '\\b.*?(?=\\n    private static function )/s',
+            $eventsSource,
+            $match,
+        ) === 1);
+        assertTrue(str_contains(
+            $match[0],
+            "self::requireTopLevelClientMsgId(\$packet, '{$operation}')",
+        ));
+    }
+});
+
+test('typing and SYNC changes expose only canonical actor identity fields', static function (): void {
+    $typingSource = (string) file_get_contents(
+        dirname(__DIR__) . '/src/Service/TypingService.php',
+    );
+    assertTrue(str_contains($typingSource, "'actor_organization' => \$context->organization"));
+    assertTrue(str_contains($typingSource, "'actor_user_id' => \$context->userId"));
+    assertTrue(!str_contains($typingSource, "'user_organization' => \$context->organization"));
+    assertTrue(!str_contains($typingSource, "'user_id' => \$context->userId"));
+
+    $messageSource = (string) file_get_contents(
+        dirname(__DIR__) . '/src/Service/MessageService.php',
+    );
+    assertTrue(str_contains(
+        $messageSource,
+        'actor_organization, actor_user_id, target_organization',
+    ));
+    assertTrue(str_contains(
+        $messageSource,
+        "'actor_organization' => (int) \$candidate['actor_organization']",
+    ));
+    assertTrue(str_contains(
+        $messageSource,
+        "'actor_user_id' => (string) \$candidate['actor_user_id']",
+    ));
+});
+
+test('SEND requires a valid top-level client_msg_id without nested fallback', static function () use ($now): void {
+    $validator = new ReflectionMethod(Events::class, 'requireTopLevelClientMsgId');
+    $validator->setAccessible(true);
+    $valid = new Packet(
+        Command::SEND,
+        ['client_msg_id' => 'nested-must-not-be-used'],
+        999,
+        'send-request-1',
+    );
+    assertTrue($validator->invoke(null, $valid, 'SEND') === 'send-request-1');
+
+    $invalidPackets = [
+        new Packet(Command::SEND, ['client_msg_id' => 'nested-only']),
+        new Packet(Command::SEND, []),
+        new Packet(Command::SEND, [], clientMsgId: ''),
+        new Packet(Command::SEND, [], clientMsgId: ' padded '),
+        new Packet(Command::SEND, [], clientMsgId: str_repeat('s', 81)),
+        new Packet(Command::SEND, [], clientMsgId: "send\0invalid"),
+    ];
+    foreach ($invalidPackets as $invalid) {
+        expectImCode(
+            'SEND_CLIENT_MSG_ID_INVALID',
+            static fn () => $validator->invoke(null, $invalid, 'SEND'),
+        );
+    }
+
+    $messages = (new ReflectionClass(MessageService::class))->newInstanceWithoutConstructor();
+    $context = new AuthContext(
+        organization: 1,
+        userId: 'send-contract-user',
+        deviceId: 'send-contract-device',
+        clientId: 'send-contract-client',
+        credentialSessionId: 'send-contract-credential',
+        sessionId: md5('send-contract-session'),
+        clientFamily: 'web',
+        os: 'browser',
+        issuer: 'deployment-main',
+        audience: 'im',
+        notBefore: $now - 10,
+        expireAt: $now + 300,
+    );
+    foreach ($invalidPackets as $invalid) {
+        expectImCode(
+            'SEND_CLIENT_MSG_ID_INVALID',
+            static fn () => $messages->send($context, $invalid),
+        );
+    }
+
+    $eventsSource = (string) file_get_contents(dirname(__DIR__) . '/src/Events.php');
+    assertTrue(preg_match(
+        '/private static function handleSend\\b.*?(?=\\n    private static function )/s',
+        $eventsSource,
+        $match,
+    ) === 1);
+    assertTrue(str_contains(
+        $match[0],
+        "self::requireTopLevelClientMsgId(\$packet, 'SEND')",
+    ));
+
+    $serviceSource = (string) file_get_contents(dirname(__DIR__) . '/src/Service/MessageService.php');
+    assertTrue(!str_contains(
+        $serviceSource,
+        "\$packet->clientMsgId ?? \$data['client_msg_id']",
+    ));
 });
 
 test('same device connections coexist with exact session binding and cleanup', static function (): void {

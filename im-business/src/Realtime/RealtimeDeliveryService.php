@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace B8im\ImBusiness\Realtime;
 
-use B8im\ImShared\Support\Constants;
 use B8im\ImBusiness\Telemetry\Telemetry;
+use B8im\ImShared\Support\Constants;
 use OpenTelemetry\API\Trace\SpanKind;
 
 final class RealtimeDeliveryService implements RealtimeEventDeliverer
@@ -19,10 +19,69 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
 
     public function deliver(RealtimeEvent $event): void
     {
-        foreach ($this->recipientUserIds($event) as $userId) {
-            $homeOrganization = (int) ($event->recipientHomes[$userId] ?? $event->organization);
-            if ($homeOrganization <= 0) {
-                $homeOrganization = $event->organization;
+        $this->assertHomeIdentities($event, $event->recipientIdentities, 'event');
+        if ($event->eventType === Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED) {
+            // The revocation notification itself must remain deliverable after
+            // the policy transition. Its canonical local target was validated
+            // by the projector, so it intentionally bypasses the current gate.
+            if (
+                $event->targetOrganization !== $event->organization
+                || $event->targetUserId === null
+                || $event->recipientIdentities !== [[
+                    'organization' => $event->targetOrganization,
+                    'user_id' => $event->targetUserId,
+                ]]
+            ) {
+                throw new \RuntimeException('access realtime target differs from its home projection');
+            }
+            $this->deliverToIdentities($event, $event->recipientIdentities);
+            return;
+        }
+
+        $targeted = $event->targetOrganization !== null || $event->targetUserId !== null;
+        if ($targeted && (
+            $event->targetOrganization !== $event->organization
+            || $event->targetUserId === null
+            || $event->recipientIdentities !== [[
+                'organization' => $event->targetOrganization,
+                'user_id' => $event->targetUserId,
+            ]]
+        )) {
+            throw new \RuntimeException('targeted realtime event identity differs from its home projection');
+        }
+
+        $this->recipients->withDeliverableIdentities(
+            $event,
+            function (array $activeIdentities) use ($event, $targeted): void {
+                $this->assertHomeIdentities($event, $activeIdentities, 'active');
+                $active = [];
+                foreach ($activeIdentities as $identity) {
+                    $active[$this->identityKey($identity)] = true;
+                }
+                $identities = array_values(array_filter(
+                    $event->recipientIdentities,
+                    fn (array $identity): bool => isset($active[$this->identityKey($identity)]),
+                ));
+                if ($targeted && count($identities) > 1) {
+                    throw new \RuntimeException('targeted realtime event resolved multiple recipients');
+                }
+
+                // The callback executes while the database authorization
+                // boundary is locked. Revocation therefore orders either
+                // before this fanout (empty identities) or after all sends.
+                $this->deliverToIdentities($event, $identities);
+            },
+        );
+    }
+
+    /** @param list<array{organization:int,user_id:string}> $identities */
+    private function deliverToIdentities(RealtimeEvent $event, array $identities): void
+    {
+        foreach ($identities as $identity) {
+            $homeOrganization = (int) $identity['organization'];
+            $userId = (string) $identity['user_id'];
+            if ($homeOrganization !== $event->organization) {
+                throw new \RuntimeException('realtime event recipient is outside its home projection');
             }
             foreach ($this->gateway->clientIdsForOrganizationUser($homeOrganization, $userId) as $clientId) {
                 if ($clientId === $event->originClientId || $this->checkpoints->wasDelivered($event, $clientId)) {
@@ -65,30 +124,22 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
         }
     }
 
-    /** @return list<string> */
-    private function recipientUserIds(RealtimeEvent $event): array
+    /** @param array{organization:int,user_id:string} $identity */
+    private function identityKey(array $identity): string
     {
-        if ($event->eventType === Constants::MQ_ROUTING_MESSAGE_DELETED_SELF) {
-            return $event->targetUserId === null ? [] : [$event->targetUserId];
-        }
-
-        $activeUserIds = $this->recipients->activeUserIds(
-            $event->organization,
-            $event->conversationId,
-            $event->messageSeq,
+        return json_encode(
+            [(int) $identity['organization'], (string) $identity['user_id']],
+            JSON_THROW_ON_ERROR,
         );
-        if ($event->eventType !== Constants::MQ_ROUTING_MESSAGE_CREATED) {
-            return $activeUserIds;
-        }
+    }
 
-        $allowed = array_fill_keys($event->recipientUserIds, true);
-        if (($event->packetData['message']['sender_id'] ?? null) === $event->originUserId) {
-            $allowed[$event->originUserId] = true;
+    /** @param list<array{organization:int,user_id:string}> $identities */
+    private function assertHomeIdentities(RealtimeEvent $event, array $identities, string $source): void
+    {
+        foreach ($identities as $identity) {
+            if ((int) ($identity['organization'] ?? 0) !== $event->organization) {
+                throw new \RuntimeException($source . ' realtime recipient is outside its home projection');
+            }
         }
-
-        return array_values(array_filter(
-            $activeUserIds,
-            static fn (string $userId): bool => isset($allowed[$userId]),
-        ));
     }
 }

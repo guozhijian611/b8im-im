@@ -173,7 +173,7 @@ if ((int) ($forbidden['aggregate'] ?? 0) !== 0) {
 $requiredIndexes = [
     'uni_organization_global_seq',
     'uni_organization_message',
-    'uni_organization_client_msg',
+    'uni_home_sender_client_msg',
     'uni_organization_conversation_seq',
     'idx_organization_conversation_global',
 ];

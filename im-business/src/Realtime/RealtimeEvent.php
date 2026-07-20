@@ -10,8 +10,7 @@ use B8im\ImShared\Telemetry\TraceContext;
 final class RealtimeEvent
 {
     /**
-     * @param list<string> $recipientUserIds
-     * @param array<string, int> $recipientHomes user_id => home organization for gateway uid binding
+     * @param list<array{organization:int,user_id:string}> $recipientIdentities
      * @param array<string, mixed> $packetData
      */
     public function __construct(
@@ -22,14 +21,18 @@ final class RealtimeEvent
         public readonly string $messageId,
         public readonly int $messageSeq,
         public readonly int $changeSeq,
+        public readonly int $actorOrganization,
         public readonly string $actorUserId,
+        public readonly int $originOrganization,
         public readonly string $originUserId,
         public readonly string $originClientId,
+        public readonly ?int $targetOrganization,
         public readonly ?string $targetUserId,
-        public readonly array $recipientUserIds,
+        public readonly ?string $crossOrgAccessSnapshotId,
+        public readonly array $recipientIdentities,
         public readonly string $packetCommand,
         public readonly array $packetData,
-        public readonly array $recipientHomes = [],
+        public readonly string $stableEventId,
     ) {
     }
 
@@ -46,11 +49,6 @@ final class RealtimeEvent
 
     public function eventId(): string
     {
-        return hash('sha256', implode('|', [
-            (string) $this->organization,
-            $this->eventType,
-            $this->messageId,
-            (string) $this->changeSeq,
-        ]));
+        return $this->stableEventId;
     }
 }

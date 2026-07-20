@@ -28,56 +28,270 @@ final class OutboxService
     ) {
     }
 
-    /**
-     * @param list<string> $recipientUserIds
-     * @param array<string, int> $recipientHomes user_id => home organization
-     */
+    /** @param list<array{organization:int,user_id:string}> $recipientIdentities */
     public function createMessageCreated(
         AuthContext $context,
+        int $homeOrganization,
         array $message,
-        array $recipientUserIds,
-        array $recipientHomes = [],
+        array $recipientIdentities,
+        ?string $crossOrgAccessSnapshotId = null,
     ): void {
         $now = $this->now();
-        $homes = [];
-        foreach ($recipientUserIds as $userId) {
-            $uid = (string) $userId;
-            $homes[$uid] = (int) ($recipientHomes[$uid] ?? $context->organization);
-        }
+        $eventId = $this->eventId([
+            $homeOrganization,
+            Constants::MQ_ROUTING_MESSAGE_CREATED,
+            (string) $message['message_id'],
+        ]);
         $payload = [
+            'event_id' => $eventId,
             'event_type' => Constants::MQ_ROUTING_MESSAGE_CREATED,
-            'organization' => $context->organization,
+            'organization' => $homeOrganization,
             'message_id' => (string) $message['message_id'],
             'message_seq' => (int) $message['message_seq'],
             'global_seq' => (string) $message['global_seq'],
             'conversation_id' => (string) $message['conversation_id'],
             'conversation_type' => (int) $message['conversation_type'],
-            'sender_id' => (string) ($message['sender_id'] ?? $context->userId),
+            'sender_id' => (string) $message['sender_id'],
+            'sender_organization' => (int) $message['sender_organization'],
             'actor_user_id' => $context->userId,
+            'actor_organization' => $context->organization,
             'origin_user_id' => $context->userId,
+            'origin_organization' => $context->organization,
             'origin_client_id' => $context->clientId,
-            'recipient_count' => count($recipientUserIds),
-            'recipient_user_ids' => array_values(array_map('strval', $recipientUserIds)),
-            'recipient_homes' => $homes,
+            'recipient_count' => count($recipientIdentities),
+            'recipient_identities' => $this->identities($recipientIdentities),
             'message' => $message,
             'created_at' => (string) $message['create_time'],
+            ...$this->accessSnapshotPayload($crossOrgAccessSnapshotId),
         ];
 
+        $this->insert(
+            eventId: $eventId,
+            organization: $homeOrganization,
+            eventType: Constants::MQ_ROUTING_MESSAGE_CREATED,
+            messageId: (string) $message['message_id'],
+            changeSeq: 0,
+            conversationId: (string) $message['conversation_id'],
+            conversationType: (int) $message['conversation_type'],
+            payload: $payload,
+            now: $now,
+        );
+    }
+
+    /**
+     * Persist a reliable message mutation event in the same transaction as the
+     * message body and im_message_change row. The payload intentionally carries
+     * no recalled or deleted message body.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function createMessageChanged(
+        AuthContext $context,
+        int $homeOrganization,
+        string $eventType,
+        string $messageId,
+        string $conversationId,
+        int $conversationType,
+        int $messageSeq,
+        int $changeSeq,
+        ?int $targetOrganization,
+        ?string $targetUserId,
+        array $payload,
+        array $recipientIdentities,
+        ?string $crossOrgAccessSnapshotId = null,
+    ): void {
+        $now = $this->now();
+        $eventId = $this->eventId([
+            $homeOrganization,
+            $eventType,
+            $messageId,
+            $changeSeq,
+        ]);
+        $eventPayload = [
+            'event_id' => $eventId,
+            'event_type' => $eventType,
+            'organization' => $homeOrganization,
+            'conversation_id' => $conversationId,
+            'conversation_type' => $conversationType,
+            'message_id' => $messageId,
+            'message_seq' => $messageSeq,
+            'change_seq' => $changeSeq,
+            'target_organization' => $targetOrganization,
+            'target_user_id' => $targetUserId,
+            'actor_user_id' => $context->userId,
+            'actor_organization' => $context->organization,
+            'origin_user_id' => $context->userId,
+            'origin_organization' => $context->organization,
+            'origin_client_id' => $context->clientId,
+            'recipient_count' => count($recipientIdentities),
+            'recipient_identities' => $this->identities($recipientIdentities),
+            'payload' => $payload,
+            'created_at' => $now,
+            ...$this->accessSnapshotPayload($crossOrgAccessSnapshotId),
+        ];
+
+        $this->insert(
+            eventId: $eventId,
+            organization: $homeOrganization,
+            eventType: $eventType,
+            messageId: $messageId,
+            changeSeq: $changeSeq,
+            conversationId: $conversationId,
+            conversationType: $conversationType,
+            payload: $eventPayload,
+            now: $now,
+        );
+    }
+
+    /** @param list<array{organization:int,user_id:string}> $recipientIdentities */
+    public function createMessageReceipt(
+        AuthContext $context,
+        int $homeOrganization,
+        array $receipt,
+        int $conversationType,
+        array $recipientIdentities,
+        ?string $crossOrgAccessSnapshotId = null,
+    ): void {
+        $status = (string) $receipt['status'];
+        $eventId = $this->eventId([
+            $homeOrganization,
+            Constants::MQ_ROUTING_MESSAGE_RECEIPT,
+            (string) $receipt['message_id'],
+            $context->organization,
+            $context->userId,
+            $status,
+        ]);
+        $payload = [
+            'event_id' => $eventId,
+            'event_type' => Constants::MQ_ROUTING_MESSAGE_RECEIPT,
+            'organization' => $homeOrganization,
+            'conversation_id' => (string) $receipt['conversation_id'],
+            'conversation_type' => $conversationType,
+            'message_id' => (string) $receipt['message_id'],
+            'message_seq' => (int) $receipt['message_seq'],
+            'change_seq' => 0,
+            'sender_organization' => (int) $receipt['sender_organization'],
+            'sender_id' => (string) $receipt['sender_id'],
+            'user_organization' => $context->organization,
+            'user_id' => $context->userId,
+            'actor_organization' => $context->organization,
+            'actor_user_id' => $context->userId,
+            'origin_organization' => $context->organization,
+            'origin_user_id' => $context->userId,
+            'origin_client_id' => $context->clientId,
+            'recipient_count' => count($recipientIdentities),
+            'recipient_identities' => $this->identities($recipientIdentities),
+            'receipt' => $receipt,
+            'created_at' => (string) $receipt['time'],
+            ...$this->accessSnapshotPayload($crossOrgAccessSnapshotId),
+        ];
+        $this->insert(
+            eventId: $eventId,
+            organization: $homeOrganization,
+            eventType: Constants::MQ_ROUTING_MESSAGE_RECEIPT,
+            messageId: (string) $receipt['message_id'],
+            changeSeq: 0,
+            conversationId: (string) $receipt['conversation_id'],
+            conversationType: $conversationType,
+            payload: $payload,
+            now: (string) $receipt['time'],
+        );
+    }
+
+    /** @param list<array{organization:int,user_id:string}> $recipientIdentities */
+    public function createConversationRead(
+        AuthContext $context,
+        int $homeOrganization,
+        array $readState,
+        int $conversationType,
+        array $recipientIdentities,
+        ?string $crossOrgAccessSnapshotId = null,
+    ): void {
+        $eventId = $this->eventId([
+            $homeOrganization,
+            Constants::MQ_ROUTING_CONVERSATION_READ,
+            (string) $readState['conversation_id'],
+            $context->organization,
+            $context->userId,
+            (int) $readState['last_read_seq'],
+        ]);
+        $payload = [
+            'event_id' => $eventId,
+            'event_type' => Constants::MQ_ROUTING_CONVERSATION_READ,
+            'organization' => $homeOrganization,
+            'conversation_id' => (string) $readState['conversation_id'],
+            'conversation_type' => $conversationType,
+            'message_id' => (string) $readState['last_read_message_id'],
+            'message_seq' => (int) $readState['last_read_seq'],
+            'change_seq' => 0,
+            'user_organization' => $context->organization,
+            'user_id' => $context->userId,
+            'actor_organization' => $context->organization,
+            'actor_user_id' => $context->userId,
+            'origin_organization' => $context->organization,
+            'origin_user_id' => $context->userId,
+            'origin_client_id' => $context->clientId,
+            'recipient_count' => count($recipientIdentities),
+            'recipient_identities' => $this->identities($recipientIdentities),
+            'read_state' => $readState,
+            'created_at' => (string) $readState['time'],
+            ...$this->accessSnapshotPayload($crossOrgAccessSnapshotId),
+        ];
+        $this->insert(
+            eventId: $eventId,
+            organization: $homeOrganization,
+            eventType: Constants::MQ_ROUTING_CONVERSATION_READ,
+            messageId: (string) $readState['last_read_message_id'],
+            changeSeq: 0,
+            conversationId: (string) $readState['conversation_id'],
+            conversationType: $conversationType,
+            payload: $payload,
+            now: (string) $readState['time'],
+        );
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function insert(
+        string $eventId,
+        int $organization,
+        string $eventType,
+        string $messageId,
+        int $changeSeq,
+        string $conversationId,
+        int $conversationType,
+        array $payload,
+        string $now,
+    ): void {
         Telemetry::run(
             'im.outbox.insert',
-            function () use ($context, $message, $payload, $now): int {
+            function () use (
+                $eventId,
+                $organization,
+                $eventType,
+                $messageId,
+                $changeSeq,
+                $conversationId,
+                $conversationType,
+                $payload,
+                $now,
+            ): int {
                 $trace = Telemetry::currentTraceContext();
                 return $this->repository->execute(
                     'INSERT INTO im_message_outbox
-                        (organization, event_type, routing_key, message_id, change_seq, conversation_id, conversation_type, payload_json, traceparent, tracestate, status, retry_count, next_retry_at, create_time, update_time)
-                     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+                        (event_id, organization, event_type, routing_key, message_id, change_seq,
+                         conversation_id, conversation_type, payload_json, traceparent, tracestate,
+                         status, retry_count, next_retry_at, create_time, update_time)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                     ON DUPLICATE KEY UPDATE event_id = VALUES(event_id)',
                     [
-                        $context->organization,
-                        Constants::MQ_ROUTING_MESSAGE_CREATED,
-                        Constants::MQ_ROUTING_MESSAGE_CREATED,
-                        (string) $message['message_id'],
-                        (string) $message['conversation_id'],
-                        (int) $message['conversation_type'],
+                        $eventId,
+                        $organization,
+                        $eventType,
+                        $eventType,
+                        $messageId,
+                        $changeSeq,
+                        $conversationId,
+                        $conversationType,
                         json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
                         $trace?->traceparent,
                         $trace?->tracestate,
@@ -94,85 +308,50 @@ final class OutboxService
                 'db.system.name' => 'mysql',
                 'db.operation.name' => 'INSERT',
                 'db.collection.name' => 'im_message_outbox',
-                'b8im.organization' => $context->organization,
-                'b8im.message_id' => (string) $message['message_id'],
-                'messaging.destination.name' => Constants::MQ_ROUTING_MESSAGE_CREATED,
+                'b8im.organization' => $organization,
+                'b8im.message_id' => $messageId,
+                'b8im.event_id' => $eventId,
+                'messaging.destination.name' => $eventType,
             ],
         );
     }
 
-    /**
-     * Persist a reliable message mutation event in the same transaction as the
-     * message body and im_message_change row. The payload intentionally carries
-     * no recalled or deleted message body.
-     *
-     * @param array<string, mixed> $payload
-     */
-    public function createMessageChanged(
-        AuthContext $context,
-        string $eventType,
-        string $messageId,
-        string $conversationId,
-        int $conversationType,
-        int $messageSeq,
-        int $changeSeq,
-        ?string $targetUserId,
-        array $payload,
-    ): void {
-        $now = $this->now();
-        $eventPayload = [
-            'event_type' => $eventType,
-            'organization' => $context->organization,
-            'conversation_id' => $conversationId,
-            'conversation_type' => $conversationType,
-            'message_id' => $messageId,
-            'message_seq' => $messageSeq,
-            'change_seq' => $changeSeq,
-            'target_user_id' => $targetUserId,
-            'actor_user_id' => $context->userId,
-            'origin_user_id' => $context->userId,
-            'origin_client_id' => $context->clientId,
-            'payload' => $payload,
-            'created_at' => $now,
-        ];
+    /** @param list<array{organization:int,user_id:string}> $identities */
+    private function identities(array $identities): array
+    {
+        $normalized = [];
+        foreach ($identities as $identity) {
+            $organization = (int) ($identity['organization'] ?? 0);
+            $userId = trim((string) ($identity['user_id'] ?? ''));
+            if ($organization <= 0 || $userId === '') {
+                throw new \InvalidArgumentException('outbox recipient identity is incomplete');
+            }
+            $normalized[$organization . ':' . $userId] = [
+                'organization' => $organization,
+                'user_id' => $userId,
+            ];
+        }
 
-        Telemetry::run(
-            'im.outbox.insert',
-            function () use ($context, $eventType, $messageId, $changeSeq, $conversationId, $conversationType, $eventPayload, $now): int {
-                $trace = Telemetry::currentTraceContext();
-                return $this->repository->execute(
-                    'INSERT INTO im_message_outbox
-                        (organization, event_type, routing_key, message_id, change_seq, conversation_id, conversation_type, payload_json, traceparent, tracestate, status, retry_count, next_retry_at, create_time, update_time)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
-                    [
-                        $context->organization,
-                        $eventType,
-                        $eventType,
-                        $messageId,
-                        $changeSeq,
-                        $conversationId,
-                        $conversationType,
-                        json_encode($eventPayload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-                        $trace?->traceparent,
-                        $trace?->tracestate,
-                        self::STATUS_PENDING,
-                        $now,
-                        $now,
-                        $now,
-                    ],
-                );
-            },
-            SpanKind::KIND_CLIENT,
-            [
-                'operation' => 'im.outbox.insert',
-                'db.system.name' => 'mysql',
-                'db.operation.name' => 'INSERT',
-                'db.collection.name' => 'im_message_outbox',
-                'b8im.organization' => $context->organization,
-                'b8im.message_id' => $messageId,
-                'messaging.destination.name' => $eventType,
-            ],
-        );
+        return array_values($normalized);
+    }
+
+    /** @return array{cross_org_access_snapshot_id:string}|array{} */
+    private function accessSnapshotPayload(?string $snapshotId): array
+    {
+        if ($snapshotId === null) {
+            return [];
+        }
+        if (preg_match('/^[1-9][0-9]{0,19}$/D', $snapshotId) !== 1) {
+            throw new \InvalidArgumentException('cross-org outbox access snapshot is invalid');
+        }
+
+        return ['cross_org_access_snapshot_id' => $snapshotId];
+    }
+
+    /** @param list<int|string> $parts */
+    private function eventId(array $parts): string
+    {
+        return hash('sha256', implode('|', array_map('strval', $parts)));
     }
 
     public function claimPending(int $limit, string $workerId): array

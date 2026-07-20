@@ -30,6 +30,7 @@ final class MessageShardRouter
         'im_auth_session',
         'im_upload_asset',
         'im_conversation',
+        'im_cross_organization_conversation',
         'im_group_profile',
         'im_conversation_member',
         'im_message_group',

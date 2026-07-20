@@ -198,6 +198,7 @@ try {
         || ($authAck['organization'] ?? null) !== 1
         || ($authAck['data']['client_id'] ?? null) !== $clientId
         || preg_match('/^[a-f0-9]{32}$/', (string) ($authAck['data']['session_id'] ?? '')) !== 1
+        || preg_match('/^(0|[1-9][0-9]*)$/', (string) ($authAck['data']['cross_org_access_snapshot_id'] ?? '')) !== 1
     ) {
         throw new RuntimeException('AUTH_ACK did not bind the trusted organization/client/session.');
     }

@@ -23,7 +23,7 @@
         }
     },
     "scripts": {
-        "test": "php tests/run.php && php tests/realtime_delivery.php && php tests/tenant_im_policy_test.php && php tests/realtime_control_events.php && php tests/module_license_checker_test.php && php tests/message_shard_router_test.php && php tests/telemetry_fiber_context_test.php && php tests/telemetry_test.php && php tests/phinx_bootstrap_test.php",
+        "test": "php tests/run.php && php tests/realtime_delivery.php && php tests/tenant_im_policy_test.php && php tests/realtime_control_events.php && php tests/module_license_checker_test.php && php tests/message_shard_router_test.php && php tests/telemetry_fiber_context_test.php && php tests/telemetry_test.php && php tests/phinx_bootstrap_test.php && php tests/cross_org_social_policy_test.php && php tests/cross_org_message_service_test.php",
         "test-realtime": "php tests/realtime_delivery.php",
         "test-realtime-control": "php tests/realtime_control_events.php",
         "test-realtime-control-redis": "php tests/realtime_control_redis_integration.php",
@@ -42,5 +42,11 @@
         "assert-database-target": "php ../bin/assert_database_target.php"
     },
     "minimum-stability": "stable",
-    "prefer-stable": true
+    "prefer-stable": true,
+    "config": {
+        "allow-plugins": {
+            "php-http/discovery": true,
+            "tbachert/spi": true
+        }
+    }
 }
