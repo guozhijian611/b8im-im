@@ -109,7 +109,9 @@ final class ConversationSyncService
                 'user_organization' => $context->organization,
                 'user_id' => $context->userId,
                 'time' => $now,
-                'cross_org_access_snapshot_id' => $access['access_snapshot_id'],
+                ...($access['is_cross_organization']
+                    ? ['cross_org_access_snapshot_id' => $access['access_snapshot_id']]
+                    : []),
             ];
             $conversation = $this->repository->fetchOne(
                 'SELECT conversation_type FROM im_conversation
