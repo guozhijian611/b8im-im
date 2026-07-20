@@ -5,9 +5,10 @@ declare(strict_types=1);
 namespace B8im\ImBusiness\Realtime;
 
 use B8im\ImBusiness\Auth\AuthContext;
+use B8im\ImBusiness\Service\GroupMemberAccessSnapshotSession;
 use GatewayWorker\Lib\Gateway;
 
-final class GatewayRealtimeGateway implements RealtimeGateway
+final class GatewayRealtimeGateway implements RealtimeGateway, GroupMemberAccessSessionInvalidator
 {
     public function clientIdsForOrganizationUser(int $organization, string $userId): array
     {
@@ -23,6 +24,18 @@ final class GatewayRealtimeGateway implements RealtimeGateway
                 'Gateway realtime delivery failed for client_id=%s',
                 $clientId,
             ));
+        }
+    }
+
+    public function invalidateGroupAccessSnapshot(string $clientId, string $currentSnapshotId): void
+    {
+        $session = Gateway::getSession($clientId);
+        if (!is_array($session)) {
+            return;
+        }
+        $updated = GroupMemberAccessSnapshotSession::invalidate($session, $currentSnapshotId);
+        if ($updated !== $session) {
+            Gateway::setSession($clientId, $updated);
         }
     }
 }

@@ -18,6 +18,7 @@ use B8im\ImBusiness\Service\ConversationSyncService;
 use B8im\ImBusiness\Service\CrossOrganizationConversationAccess;
 use B8im\ImBusiness\Service\CrossOrganizationSocialPolicy;
 use B8im\ImBusiness\Service\DeviceService;
+use B8im\ImBusiness\Service\GroupMemberAccessSnapshotService;
 use B8im\ImBusiness\Service\MessageService;
 use B8im\ImBusiness\Service\ModuleLicenseChecker;
 use B8im\ImBusiness\Service\OutboxService;
@@ -40,6 +41,7 @@ final class Runtime
     private static ?TypingService $typing = null;
     private static ?PresenceService $presence = null;
     private static ?ConversationSyncService $conversationSync = null;
+    private static ?GroupMemberAccessSnapshotService $groupMemberAccess = null;
     private static ?CrossOrganizationSocialPolicy $crossOrgSocial = null;
     private static ?CrossOrganizationConversationAccess $conversationAccess = null;
     private static ?ModuleLicenseChecker $moduleLicense = null;
@@ -62,6 +64,10 @@ final class Runtime
         self::$crossOrgSocial = new CrossOrganizationSocialPolicy($repository);
         self::$conversationAccess = new CrossOrganizationConversationAccess($repository, self::$crossOrgSocial);
         $outbox = new OutboxService($repository, $config);
+        self::$groupMemberAccess = new GroupMemberAccessSnapshotService(
+            $repository,
+            $config->imTokenSecret,
+        );
         self::$messages = new MessageService(
             $repository,
             $config,
@@ -69,6 +75,7 @@ final class Runtime
             self::$tenantImPolicies,
             self::$crossOrgSocial,
             self::$conversationAccess,
+            self::$groupMemberAccess,
         );
         self::$messages->preflight();
         self::$realtimeEvents = RealtimeEventConsumer::connect(
@@ -140,6 +147,11 @@ final class Runtime
     public static function conversationSync(): ConversationSyncService
     {
         return self::$conversationSync ?? throw new \RuntimeException('IM Runtime 尚未启动');
+    }
+
+    public static function groupMemberAccess(): GroupMemberAccessSnapshotService
+    {
+        return self::$groupMemberAccess ?? throw new \RuntimeException('IM Runtime 尚未启动');
     }
 
     public static function cmdDispatcher(): CmdDispatcher

@@ -215,6 +215,7 @@ final class RabbitMqRealtimeConsumer
             Constants::MQ_ROUTING_MESSAGE_RECEIPT,
             Constants::MQ_ROUTING_CONVERSATION_READ,
             Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+            Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
         ] as $routingKey) {
             $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, $routingKey);
         }

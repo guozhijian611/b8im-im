@@ -14,7 +14,10 @@ use PDOException;
 use Throwable;
 use B8im\ImBusiness\Service\ModuleLicenseRepositoryInterface;
 
-final class ImRepository implements MessageShardRepositoryInterface, ModuleLicenseRepositoryInterface
+final class ImRepository implements
+    MessageShardRepositoryInterface,
+    ModuleLicenseRepositoryInterface,
+    GroupMemberAccessRepository
 {
     private PDO $pdo;
     private int $transactionDepth = 0;

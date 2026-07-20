@@ -14,8 +14,10 @@ use B8im\ImBusiness\Auth\AuthContext;
 use B8im\ImBusiness\Auth\ConnectionFailurePolicy;
 use B8im\ImBusiness\Auth\SessionResolver;
 use B8im\ImBusiness\Exception\ImException;
+use B8im\ImBusiness\Service\GroupMemberAccessSnapshotSession;
 use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Protocol\Command;
+use B8im\ImShared\Protocol\GroupMemberAccessError;
 use B8im\ImBusiness\Telemetry\Telemetry;
 use OpenTelemetry\API\Trace\SpanKind;
 use Workerman\Timer;
@@ -99,6 +101,7 @@ class Events
                 Command::DELETE => self::handleDelete($clientId, $packet),
                 Command::SCREENSHOT => self::handleScreenshot($clientId, $packet),
                 Command::SYNC => self::handleSync($clientId, $packet),
+                Command::GROUP_MEMBER_ACCESS_SNAPSHOT => self::handleGroupMemberAccessSnapshot($clientId, $packet),
                 Command::TYPING => self::handleTyping($clientId, $packet),
                 Command::PRESENCE => self::handlePresence($clientId, $packet),
                 Command::CONVERSATION_READ => self::handleConversationRead($clientId, $packet),
@@ -207,6 +210,10 @@ class Events
             static fn () => Runtime::tenantImPolicies()->authorizeAuth($context),
             attributes: ['operation' => 'im.auth.tenant_policy', 'b8im.organization' => $context->organization],
         );
+        $accessSnapshotId = Runtime::groupMemberAccess()->currentSnapshotId(
+            $context->organization,
+            $context->userId,
+        );
 
         try {
             foreach ($decision->clientIdsToDisconnect as $oldClientId) {
@@ -243,6 +250,7 @@ class Events
                 'not_before' => $context->notBefore,
                 'expire_at' => $context->expireAt,
                 'cross_org_access_snapshot_id' => Runtime::crossOrgSocial()->snapshotId(true),
+                'access_snapshot_id' => $accessSnapshotId,
             ], $context->organization)->encode()
         );
     }
@@ -377,6 +385,10 @@ class Events
     {
         $clientMsgId = self::requireTopLevelClientMsgId($packet, 'SYNC');
         $context = self::requireContext($clientId);
+        self::assertConnectionAccessSnapshot(
+            $clientId,
+            $packet->data['access_snapshot_id'] ?? null,
+        );
         $data = $packet->data;
         unset($data['client_msg_id']);
         $result = Runtime::messages()->sync($context, $data);
@@ -386,6 +398,95 @@ class Events
             $context->organization,
             $clientMsgId,
         )->encode());
+    }
+
+    private static function handleGroupMemberAccessSnapshot(string $clientId, Packet $packet): void
+    {
+        $clientMsgId = self::requireTopLevelClientMsgId($packet, 'GROUP_MEMBER_ACCESS_SNAPSHOT');
+        $context = self::requireContext($clientId);
+        if (
+            !array_key_exists('access_snapshot_id', $packet->data)
+            || !array_key_exists('cursor', $packet->data)
+            || !array_key_exists('limit', $packet->data)
+        ) {
+            throw new ImException(
+                '访问快照请求必须显式提供 access_snapshot_id、cursor 和 limit',
+                GroupMemberAccessError::REQUEST_INVALID,
+            );
+        }
+        $snapshotId = $packet->data['access_snapshot_id'];
+        $cursor = $packet->data['cursor'];
+        $limit = $packet->data['limit'];
+        $firstPage = $snapshotId === null && $cursor === null;
+        $continuation = is_string($snapshotId) && is_string($cursor) && is_int($limit);
+        try {
+            $session = Gateway::getSession($clientId);
+            if (!is_array($session) || empty($session['user_id'])) {
+                throw new ImException('连接鉴权上下文无效', 'AUTH_CONTEXT_INVALID');
+            }
+            if ($continuation) {
+                GroupMemberAccessSnapshotSession::assertContinuation(
+                    $session,
+                    $snapshotId,
+                    $cursor,
+                    $limit,
+                );
+            }
+            $result = Runtime::groupMemberAccess()->page(
+                $context->organization,
+                $context->userId,
+                $snapshotId,
+                $cursor,
+                $limit,
+            );
+            Runtime::groupMemberAccess()->commitPageIfCurrent(
+                $context->organization,
+                $context->userId,
+                $result['access_snapshot_id'],
+                static function () use (
+                    $clientId,
+                    $firstPage,
+                    $continuation,
+                    $snapshotId,
+                    $cursor,
+                    $limit,
+                    $result,
+                ): void {
+                    $session = Gateway::getSession($clientId);
+                    if (!is_array($session) || empty($session['user_id'])) {
+                        throw new ImException('连接鉴权上下文无效', 'AUTH_CONTEXT_INVALID');
+                    }
+                    if ($firstPage) {
+                        $session = GroupMemberAccessSnapshotSession::begin($session);
+                    } elseif ($continuation) {
+                        GroupMemberAccessSnapshotSession::assertContinuation(
+                            $session,
+                            $snapshotId,
+                            $cursor,
+                            $limit,
+                        );
+                    }
+                    $session = GroupMemberAccessSnapshotSession::advance($session, $result, (int) $limit);
+                    Gateway::setSession($clientId, $session);
+                },
+            );
+        } catch (ImException $exception) {
+            $session = Gateway::getSession($clientId);
+            if (is_array($session)) {
+                $session = GroupMemberAccessSnapshotSession::abort($session);
+                Gateway::setSession($clientId, $session);
+            }
+            throw $exception;
+        }
+        Gateway::sendToClient(
+            $clientId,
+            self::responsePacket(
+                Command::GROUP_MEMBER_ACCESS_SNAPSHOT_ACK,
+                $result,
+                $context->organization,
+                $clientMsgId,
+            )->encode(),
+        );
     }
 
     private static function handleTyping(string $clientId, Packet $packet): void
@@ -543,5 +644,22 @@ class Events
         }
 
         return $clientMsgId;
+    }
+
+    private static function assertConnectionAccessSnapshot(string $clientId, mixed $requestedSnapshotId): void
+    {
+        if (!is_string($requestedSnapshotId)) {
+            throw new ImException('SYNC 缺少 access_snapshot_id', GroupMemberAccessError::SNAPSHOT_REQUIRED);
+        }
+        $session = Gateway::getSession($clientId);
+        $completedSnapshotId = is_array($session)
+            ? ($session['access_snapshot_id'] ?? null)
+            : null;
+        if (!is_string($completedSnapshotId) || !hash_equals($completedSnapshotId, $requestedSnapshotId)) {
+            throw new ImException(
+                '当前连接尚未完成同 epoch 的群访问快照',
+                GroupMemberAccessError::SNAPSHOT_NOT_COMPLETED,
+            );
+        }
     }
 }

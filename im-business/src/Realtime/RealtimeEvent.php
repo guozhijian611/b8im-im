@@ -33,6 +33,11 @@ final class RealtimeEvent
         public readonly string $packetCommand,
         public readonly array $packetData,
         public readonly string $stableEventId,
+        public readonly ?string $groupAccessSnapshotId = null,
+        public readonly ?string $groupAccessVersion = null,
+        public readonly ?string $groupAccessState = null,
+        public readonly ?string $groupLastMessageSeq = null,
+        public readonly ?string $groupLastChangeSeq = null,
     ) {
     }
 

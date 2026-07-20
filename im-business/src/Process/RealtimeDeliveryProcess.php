@@ -7,6 +7,7 @@ namespace B8im\ImBusiness\Process;
 use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Queue\RabbitMqRealtimeConsumer;
 use B8im\ImBusiness\Realtime\DatabaseRealtimeRecipientProvider;
+use B8im\ImBusiness\Realtime\DatabaseGroupMemberAccessRealtimeAuthorizer;
 use B8im\ImBusiness\Realtime\GatewayRealtimeGateway;
 use B8im\ImBusiness\Realtime\RealtimeDeliveryHandler;
 use B8im\ImBusiness\Realtime\RealtimeDeliveryService;
@@ -91,6 +92,7 @@ final class RealtimeDeliveryProcess
             new DatabaseRealtimeRecipientProvider($repository),
             new GatewayRealtimeGateway(),
             RedisRealtimeDeliveryCheckpoint::connect($this->config),
+            new DatabaseGroupMemberAccessRealtimeAuthorizer($repository),
         );
         $handler = new RealtimeDeliveryHandler(
             new RealtimeEventProjector(),

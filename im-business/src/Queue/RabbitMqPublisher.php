@@ -145,6 +145,7 @@ final class RabbitMqPublisher
         $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_MESSAGE_RECEIPT);
         $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_CONVERSATION_READ);
         $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED);
+        $channel->queue_bind(Constants::MQ_MESSAGE_AFTER, $exchange, Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED);
         $this->declareQueue($channel, Constants::MQ_GROUP_FANOUT, Constants::MQ_ROUTING_GROUP_FANOUT, $queueOptions);
         $this->declareQueue($channel, Constants::MQ_OFFLINE_PUSH, Constants::MQ_ROUTING_OFFLINE_PUSH, $queueOptions);
         $this->declareQueue($channel, Constants::MQ_MESSAGE_AUDIT, Constants::MQ_ROUTING_MESSAGE_AUDIT, $queueOptions);
