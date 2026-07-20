@@ -142,9 +142,11 @@ $cleanup = static function () use (
             'im_message_user_delete',
             'im_message_receipt',
             'im_message_index',
+            'im_group_member_access_audit',
             'im_conversation_membership_period',
             'im_conversation_member',
             'im_conversation',
+            'im_user_group_access_state',
             'im_user_profile',
             'im_user_privacy_setting',
             'im_organization_message_sequence',
@@ -230,6 +232,12 @@ foreach ([
     $repository->execute(
         'INSERT INTO im_user_privacy_setting (organization, user_id, allow_add_by_mobile, allow_add_by_short_no, allow_add_by_username, create_time, update_time)
          VALUES (?, ?, 1, 1, 1, ?, ?)',
+        [$org, $uid, $now, $now],
+    );
+    $repository->execute(
+        'INSERT INTO im_user_group_access_state
+            (organization, user_id, access_snapshot_id, create_time, update_time)
+         VALUES (?, ?, 1, ?, ?)',
         [$org, $uid, $now, $now],
     );
     $repository->execute(
@@ -393,6 +401,30 @@ $context = static function (int $org, string $userId, ?string $clientId = null) 
         expireAt: time() + 3600,
         username: $userId,
     );
+};
+
+$currentGroupAccessSnapshot = static function (AuthContext $authContext) use ($repository): string {
+    $row = $repository->fetchOne(
+        'SELECT access_snapshot_id
+           FROM im_user_group_access_state
+          WHERE organization = ? AND user_id = ?
+          LIMIT 1',
+        [$authContext->organization, $authContext->userId],
+    );
+    $snapshotId = (string) ($row['access_snapshot_id'] ?? '');
+    if (preg_match('/^[1-9][0-9]*$/D', $snapshotId) !== 1) {
+        throw new RuntimeException('test user group access snapshot is not initialized');
+    }
+
+    return $snapshotId;
+};
+$syncMessages = static function (AuthContext $authContext, array $data) use (
+    &$messages,
+    $currentGroupAccessSnapshot,
+): array {
+    $data['access_snapshot_id'] = $currentGroupAccessSnapshot($authContext);
+
+    return $messages->sync($authContext, $data);
 };
 
 $blockedUpdate = static function (string $sql, array $params) use ($config): bool {
@@ -1200,7 +1232,7 @@ $assert(
         && ($editAck['content'] ?? null) === ['text' => 'edited-cross-org-service-test'],
     'edit ACK binds request, actor, conversation, message and normalized content',
 );
-$changeSync = $messages->sync($context($orgB, $userB), [
+$changeSync = $syncMessages($context($orgB, $userB), [
     'conversation_id' => $conversationId,
     'after_seq' => 3,
     'after_change_seq' => 0,
@@ -1640,7 +1672,7 @@ $badGroupOperations = [
         'status' => 'read',
         'client_msg_id' => 'bad-group-ack-' . $suffix,
     ]),
-    'SYNC' => static fn () => $messages->sync($context($orgA, $userA), [
+    'SYNC' => static fn () => $syncMessages($context($orgA, $userA), [
         'conversation_id' => $badGroupId,
         'after_global_seq' => '0',
     ]),
@@ -2034,7 +2066,7 @@ $offOperations = [
         'conversation_id' => $conversationId,
         'client_msg_id' => 'off-screenshot-' . $suffix,
     ]),
-    'conversation_sync' => static fn () => $messages->sync($context($orgA, $userA), [
+    'conversation_sync' => static fn () => $syncMessages($context($orgA, $userA), [
         'conversation_id' => $conversationId,
         'after_global_seq' => '0',
     ]),
@@ -2065,7 +2097,7 @@ foreach ($offOperations as $operation => $invoke) {
     }
 }
 
-$globalAfterRevoke = $messages->sync($context($orgA, $userA), ['after_global_seq' => '0', 'limit' => 50]);
+$globalAfterRevoke = $syncMessages($context($orgA, $userA), ['after_global_seq' => '0', 'limit' => 50]);
 $globalAfterRevokeConversationIds = array_column(
     $globalAfterRevoke['messages'] ?? [],
     'conversation_id',
@@ -2232,7 +2264,7 @@ $friendAuthorizer->withCurrentRequest(
 $assert(!$inactiveFriendDelivered, 'inactive peer organization drops current friend event');
 
 try {
-    $messages->sync($context($orgA, $userA), [
+    $syncMessages($context($orgA, $userA), [
         'conversation_id' => $conversationId,
         'after_global_seq' => '0',
     ]);
@@ -2243,7 +2275,7 @@ try {
         'inactive peer organization has access-revoked code',
     );
 }
-$globalAfterOrgDisable = $messages->sync(
+$globalAfterOrgDisable = $syncMessages(
     $context($orgA, $userA),
     ['after_global_seq' => '0', 'limit' => 50],
 );
