@@ -26,6 +26,7 @@ jobs:
       IM_TOKEN_SECRET: ci-group-access-token-secret-20260720-minimum-32-bytes
       IM_GROUP_ACCESS_MIGRATION_MYSQL_TEST: 1
       IM_MESSAGE_TIME_MIGRATION_MYSQL_TEST: 1
+      IM_SEARCH_SEQUENCE_MYSQL_TEST: 1
     services:
       mysql:
         image: mysql:8.0
@@ -165,6 +166,7 @@ jobs:
           grep -Fq '192 passed, 0 failed' /tmp/im-business-test.log
           grep -Fq 'migration up succeeds again after destructive down' /tmp/im-business-test.log
           grep -Fq 'Message create_time migration MySQL integration' /tmp/im-business-test.log
+          grep -Fq 'Search projection sequence MySQL integration' /tmp/im-business-test.log
 
       - name: Syntax-check register
         run: find b8im-im/im-register/src -name '*.php' -print0 | xargs -0 -n1 php -l

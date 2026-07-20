@@ -15,14 +15,22 @@ require dirname(__DIR__) . '/vendor/autoload.php';
 $traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
 $context = new TraceContext($traceparent, 'b8im=test');
 $headers = RabbitMqPublisher::applicationHeaders([
+    'event_contract' => 'im.search-projection.v1',
+    'event_id' => str_repeat('a', 64),
     'organization' => 7,
     'event_type' => 'message.created',
+    'source_event_seq' => '18446744073709551615',
+    'message_id' => 'message-1',
     'content' => ['text' => 'must never become a header'],
 ], $context);
 
 if ($headers !== [
+    'event_contract' => 'im.search-projection.v1',
+    'event_id' => str_repeat('a', 64),
     'organization' => 7,
     'event_type' => 'message.created',
+    'source_event_seq' => '18446744073709551615',
+    'message_id' => 'message-1',
     'traceparent' => $traceparent,
     'tracestate' => 'b8im=test',
 ]) {
@@ -30,6 +38,50 @@ if ($headers !== [
 }
 if (array_key_exists('content', $headers) || array_key_exists('baggage', $headers)) {
     throw new RuntimeException('sensitive or unsupported propagation header was emitted');
+}
+if (RabbitMqPublisher::brokerMessageId([
+    'event_contract' => 'im.search-projection.v1',
+    'event_id' => str_repeat('a', 64),
+    'organization' => 7,
+    'event_type' => 'message.created',
+    'source_event_seq' => '1',
+    'message_id' => 'message-1',
+], 99, 'message-1') !== str_repeat('a', 64)) {
+    throw new RuntimeException('search RabbitMQ message_id property is not the stable event_id');
+}
+$ordinaryHeaders = RabbitMqPublisher::applicationHeaders([
+    'organization' => 7,
+    'event_type' => 'message.receipt',
+    'event_id' => str_repeat('b', 64),
+    'message_id' => 'message-1',
+], null);
+if ($ordinaryHeaders !== [
+    'organization' => 7,
+    'event_type' => 'message.receipt',
+]) {
+    throw new RuntimeException('ordinary outbox event leaked search projection identity headers');
+}
+if (RabbitMqPublisher::brokerMessageId([
+    'organization' => 7,
+    'event_type' => 'message.receipt',
+], 99, 'message-1') !== 'im-outbox-99-message-1') {
+    throw new RuntimeException('ordinary RabbitMQ message_id property changed unexpectedly');
+}
+foreach (['event_contract', 'event_id', 'source_event_seq', 'message_id'] as $field) {
+    $invalid = [
+        'event_contract' => 'im.search-projection.v1',
+        'event_id' => str_repeat('a', 64),
+        'organization' => 7,
+        'event_type' => 'message.created',
+        'source_event_seq' => '1',
+        'message_id' => 'message-1',
+    ];
+    unset($invalid[$field]);
+    try {
+        RabbitMqPublisher::applicationHeaders($invalid, null);
+        throw new RuntimeException('incomplete search projection identity was accepted: ' . $field);
+    } catch (InvalidArgumentException) {
+    }
 }
 
 $safeAttributes = new ReflectionMethod(Telemetry::class, 'safeAttributes');

@@ -73,6 +73,11 @@ final class ImRepository implements
         return (int) $this->pdo->lastInsertId();
     }
 
+    public function inTransaction(): bool
+    {
+        return $this->transactionDepth > 0 && $this->pdo->inTransaction();
+    }
+
     private function createPdo(): PDO
     {
         $dsn = sprintf(

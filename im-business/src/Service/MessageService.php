@@ -133,14 +133,12 @@ final class MessageService
                 'im.message.persist',
                 function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTables, $now): array {
                     return $this->repository->transaction(function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTables, $now): array {
+                        $this->lockSearchProjectionOrganizations(array_keys($messageTables));
                         $conversation = $conversationType === self::CONVERSATION_SINGLE
                             ? $this->ensureSingleConversation($context, $data)
                             : $this->ensureGroupConversation($context, $data);
 
                         $homeOrganizations = $conversation['home_organizations'];
-                        foreach ($homeOrganizations as $homeOrganization) {
-                            $this->ensureOrganizationSequence($homeOrganization);
-                        }
                         $messageSeq = $this->allocateMessageSeq(
                             (string) $conversation['conversation_id'],
                             $homeOrganizations,
@@ -463,6 +461,7 @@ final class MessageService
             $conversationId,
             $accessPreview,
         ): array {
+            $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
             $homePolicies = $this->lockCrossHomeTenantPolicyBoundary(
                 $accessPreview['home_organizations'],
             );
@@ -619,6 +618,7 @@ final class MessageService
             $clientMsgId,
             $accessPreview,
         ): array {
+            $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
             $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
             $access = $this->conversationAccess->assertAccessible(
                 $context->organization,
@@ -703,6 +703,9 @@ final class MessageService
             $conversationId,
             $accessPreview,
         ): array {
+            if ($scope === 'both') {
+                $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
+            }
             $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
             $access = $this->conversationAccess->assertAccessible(
                 $context->organization,
@@ -881,6 +884,7 @@ final class MessageService
             $conversationId,
             $accessPreview,
         ): array {
+            $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
             $homePolicies = $this->lockCrossHomeTenantPolicyBoundary(
                 $accessPreview['home_organizations'],
             );
@@ -1764,6 +1768,23 @@ final class MessageService
         if ($row === null) {
             throw new ImException('机构消息序号无法初始化', 'GLOBAL_SEQ_ORGANIZATION_INACTIVE');
         }
+    }
+
+    /** @param list<int> $homeOrganizations */
+    private function lockSearchProjectionOrganizations(array $homeOrganizations): void
+    {
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if ($homeOrganizations === [] || $homeOrganizations[0] <= 0) {
+            throw new ImException(
+                '搜索投影机构序号边界无效',
+                'SEARCH_PROJECTION_ORGANIZATION_INVALID',
+            );
+        }
+        foreach ($homeOrganizations as $homeOrganization) {
+            $this->ensureOrganizationSequence($homeOrganization);
+        }
+        $this->outbox->lockSearchProjectionSequences($homeOrganizations);
     }
 
     /**

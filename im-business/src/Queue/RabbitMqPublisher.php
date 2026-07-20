@@ -9,6 +9,7 @@ declare(strict_types=1);
 namespace B8im\ImBusiness\Queue;
 
 use B8im\ImBusiness\Config;
+use B8im\ImShared\Protocol\Dto\SearchProjectionEvent;
 use B8im\ImShared\Support\Constants;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
@@ -60,12 +61,55 @@ final class RabbitMqPublisher
     /** @return array<string, int|string> */
     public static function applicationHeaders(array $payload, ?TraceContext $traceContext): array
     {
-        return array_filter([
+        $searchIdentity = self::searchProjectionIdentity($payload);
+        $identityHeaders = $searchIdentity?->toArray() ?? [
             'organization' => (int) ($payload['organization'] ?? 0),
             'event_type' => (string) ($payload['event_type'] ?? ''),
+        ];
+
+        return array_filter([
+            ...$identityHeaders,
             'traceparent' => $traceContext?->traceparent,
             'tracestate' => $traceContext?->tracestate,
         ], static fn (mixed $value): bool => $value !== null && $value !== '');
+    }
+
+    public static function searchProjectionIdentity(array $payload): ?SearchProjectionEvent
+    {
+        $eventType = $payload['event_type'] ?? null;
+        if (!is_string($eventType) || !in_array($eventType, SearchProjectionEvent::EVENT_TYPES, true)) {
+            if (array_key_exists('event_contract', $payload) || array_key_exists('source_event_seq', $payload)) {
+                throw new \InvalidArgumentException(
+                    'non-search event contains search projection identity fields',
+                );
+            }
+            return null;
+        }
+
+        $identity = [];
+        foreach (SearchProjectionEvent::FIELDS as $field) {
+            if (!array_key_exists($field, $payload)) {
+                throw new \InvalidArgumentException(
+                    'search projection payload is missing authoritative field ' . $field,
+                );
+            }
+            $identity[$field] = $payload[$field];
+        }
+
+        return SearchProjectionEvent::fromArray($identity);
+    }
+
+    public static function brokerMessageId(array $payload, int $outboxId, string $messageId): string
+    {
+        $searchIdentity = self::searchProjectionIdentity($payload);
+        if ($searchIdentity !== null) {
+            return $searchIdentity->eventId;
+        }
+        if ($outboxId <= 0 || $messageId === '') {
+            throw new \InvalidArgumentException('ordinary outbox broker message identity is incomplete');
+        }
+
+        return 'im-outbox-' . $outboxId . '-' . $messageId;
     }
 
     public function close(): void

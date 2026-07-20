@@ -119,7 +119,30 @@ final class OutboxPublisherProcess
                 throw new \RuntimeException('outbox payload is not an object');
             }
 
-            $messageId = 'im-outbox-' . $id . '-' . (string) $row['message_id'];
+            $searchIdentity = RabbitMqPublisher::searchProjectionIdentity($payload);
+            $rowSourceEventSeq = $row['source_event_seq'] ?? null;
+            if ($searchIdentity !== null) {
+                if (
+                    $searchIdentity->eventId !== (string) ($row['event_id'] ?? '')
+                    || $searchIdentity->organization !== (int) ($row['organization'] ?? 0)
+                    || $searchIdentity->eventType !== (string) ($row['event_type'] ?? '')
+                    || $searchIdentity->eventType !== (string) ($row['routing_key'] ?? '')
+                    || $searchIdentity->sourceEventSeq !== (string) $rowSourceEventSeq
+                    || $searchIdentity->messageId !== (string) ($row['message_id'] ?? '')
+                ) {
+                    throw new \RuntimeException(
+                        'search projection payload identity differs from the claimed outbox row',
+                    );
+                }
+            } elseif ($rowSourceEventSeq !== null) {
+                throw new \RuntimeException('non-search outbox row has a source_event_seq');
+            }
+
+            $messageId = RabbitMqPublisher::brokerMessageId(
+                $payload,
+                $id,
+                (string) $row['message_id'],
+            );
             $this->publisher?->publish(
                 (string) $row['routing_key'],
                 $payload,
