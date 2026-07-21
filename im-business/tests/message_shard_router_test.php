@@ -65,6 +65,7 @@ function completeRuntimeTables(): array
         'im_message_user_delete',
         'im_message_change',
         'im_message_outbox',
+        'im_realtime_control_outbox',
         'sm_tenant_im_policy',
         'im_message',
         sprintf('im_message_0000_%s', date('Ym')),

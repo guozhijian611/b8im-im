@@ -42,6 +42,7 @@ final class MessageShardRouter
         'im_message_user_delete',
         'im_message_change',
         'im_message_outbox',
+        'im_realtime_control_outbox',
         'sm_tenant_im_policy',
     ];
 

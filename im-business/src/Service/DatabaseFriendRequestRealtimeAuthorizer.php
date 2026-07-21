@@ -16,55 +16,35 @@ final class DatabaseFriendRequestRealtimeAuthorizer implements FriendRequestReal
     ) {
     }
 
-    public function withCurrentRequest(
-        int $eventOrganization,
-        int $requestId,
-        int $fromOrganization,
-        string $fromUserId,
-        int $toOrganization,
-        string $toUserId,
-        ?string $crossOrgAccessSnapshotId,
-        callable $delivery,
-    ): void {
-        $this->repository->transaction(function () use (
-            $eventOrganization,
-            $requestId,
-            $fromOrganization,
-            $fromUserId,
-            $toOrganization,
-            $toUserId,
-            $crossOrgAccessSnapshotId,
-            $delivery,
-        ): void {
-            $crossOrganization = $fromOrganization !== $toOrganization;
-            if ($eventOrganization !== $toOrganization) {
-                return;
-            }
+    public function withCurrentEvent(FriendRequestRealtimeEvent $event, callable $delivery): void
+    {
+        $this->repository->transaction(function () use ($event, $delivery): void {
+            $crossOrganization = $event->fromOrganization !== $event->toOrganization;
 
             if ($crossOrganization) {
-                if ($crossOrgAccessSnapshotId === null) {
+                if ($event->crossOrgAccessSnapshotId === null) {
                     return;
                 }
                 try {
                     $state = $this->conversationAccess->lockCrossOrganizationWriteBoundary([
-                        $fromOrganization,
-                        $toOrganization,
+                        $event->fromOrganization,
+                        $event->toOrganization,
                     ]);
                 } catch (ImException) {
                     return;
                 }
-                if (!hash_equals($state['access_snapshot_id'], $crossOrgAccessSnapshotId)) {
+                if (!hash_equals($state['access_snapshot_id'], $event->crossOrgAccessSnapshotId)) {
                     return;
                 }
             } else {
-                if ($crossOrgAccessSnapshotId !== null) {
+                if ($event->crossOrgAccessSnapshotId !== null) {
                     return;
                 }
                 $organization = $this->repository->fetchOne(
                     'SELECT id FROM sm_system_organization
                       WHERE id = ? AND status = 1 AND delete_time IS NULL
                       LIMIT 1 LOCK IN SHARE MODE',
-                    [$toOrganization],
+                    [$event->toOrganization],
                 );
                 if ($organization === null) {
                     return;
@@ -72,10 +52,10 @@ final class DatabaseFriendRequestRealtimeAuthorizer implements FriendRequestReal
             }
 
             $identities = self::orderedIdentities(
-                $fromOrganization,
-                $fromUserId,
-                $toOrganization,
-                $toUserId,
+                $event->fromOrganization,
+                $event->fromUserId,
+                $event->toOrganization,
+                $event->toUserId,
             );
             if (hash_equals($identities[0]['key'], $identities[1]['key'])) {
                 return;
@@ -108,24 +88,61 @@ final class DatabaseFriendRequestRealtimeAuthorizer implements FriendRequestReal
 
             $request = $this->repository->fetchOne(
                 'SELECT id, organization, from_organization, to_organization,
-                        from_user_id, to_user_id, status, delete_time
+                        from_user_id, to_user_id, status, handle_time, create_time, delete_time
                    FROM im_friend_request
                   WHERE id = ?
                   LIMIT 1 LOCK IN SHARE MODE',
-                [$requestId],
+                [$event->requestId],
             );
             if (
                 $request === null
-                || (int) ($request['id'] ?? 0) !== $requestId
-                || (int) ($request['organization'] ?? 0) !== $toOrganization
-                || (int) ($request['from_organization'] ?? 0) !== $fromOrganization
-                || (int) ($request['to_organization'] ?? 0) !== $toOrganization
-                || !hash_equals((string) ($request['from_user_id'] ?? ''), $fromUserId)
-                || !hash_equals((string) ($request['to_user_id'] ?? ''), $toUserId)
-                || (int) ($request['status'] ?? 0) !== 1
+                || (int) ($request['id'] ?? 0) !== $event->requestId
+                || (int) ($request['organization'] ?? 0) !== $event->toOrganization
+                || (int) ($request['from_organization'] ?? 0) !== $event->fromOrganization
+                || (int) ($request['to_organization'] ?? 0) !== $event->toOrganization
+                || !hash_equals((string) ($request['from_user_id'] ?? ''), $event->fromUserId)
+                || !hash_equals((string) ($request['to_user_id'] ?? ''), $event->toUserId)
+                || (int) ($request['status'] ?? 0) !== $event->status
+                || !hash_equals((string) ($request['create_time'] ?? ''), $event->createTime)
                 || ($request['delete_time'] ?? null) !== null
             ) {
                 return;
+            }
+            $requestHandleTime = $request['handle_time'] ?? null;
+            if (
+                ($event->handleTime === null && $requestHandleTime !== null)
+                || ($event->handleTime !== null && (
+                    !is_string($requestHandleTime)
+                    || !hash_equals($requestHandleTime, $event->handleTime)
+                ))
+            ) {
+                return;
+            }
+
+            if ($event->event === FriendRequestRealtimeEvent::ACCEPTED) {
+                foreach ([
+                    [$event->fromOrganization, $event->fromUserId, $event->toOrganization, $event->toUserId],
+                    [$event->toOrganization, $event->toUserId, $event->fromOrganization, $event->fromUserId],
+                ] as [$ownerOrganization, $ownerUserId, $friendOrganization, $friendUserId]) {
+                    $relation = $this->repository->fetchOne(
+                        'SELECT organization,user_id,friend_organization,friend_user_id,status,delete_time '
+                        . 'FROM im_friend_relation WHERE organization=? AND BINARY user_id=BINARY ? '
+                        . 'AND friend_organization=? AND BINARY friend_user_id=BINARY ? AND status=1 '
+                        . 'AND delete_time IS NULL LIMIT 1 LOCK IN SHARE MODE',
+                        [$ownerOrganization, $ownerUserId, $friendOrganization, $friendUserId],
+                    );
+                    if (
+                        $relation === null
+                        || (int) ($relation['organization'] ?? 0) !== $ownerOrganization
+                        || !hash_equals((string) ($relation['user_id'] ?? ''), $ownerUserId)
+                        || (int) ($relation['friend_organization'] ?? 0) !== $friendOrganization
+                        || !hash_equals((string) ($relation['friend_user_id'] ?? ''), $friendUserId)
+                        || (int) ($relation['status'] ?? 0) !== 1
+                        || ($relation['delete_time'] ?? null) !== null
+                    ) {
+                        return;
+                    }
+                }
             }
 
             // Keep every policy/organization/user/request lock until the

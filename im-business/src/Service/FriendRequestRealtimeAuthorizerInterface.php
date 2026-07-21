@@ -15,14 +15,8 @@ interface FriendRequestRealtimeAuthorizerInterface
      *
      * @param callable():void $delivery
      */
-    public function withCurrentRequest(
-        int $eventOrganization,
-        int $requestId,
-        int $fromOrganization,
-        string $fromUserId,
-        int $toOrganization,
-        string $toUserId,
-        ?string $crossOrgAccessSnapshotId,
+    public function withCurrentEvent(
+        FriendRequestRealtimeEvent $event,
         callable $delivery,
     ): void;
 }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 use B8im\ImBusiness\Service\RealtimeEventClaim;
 use B8im\ImBusiness\Service\RedisRealtimeEventStore;
+use B8im\ImBusiness\Queue\RedisRealtimeControlPublisher;
+use B8im\ImBusiness\Queue\RedisRealtimeControlSocket;
 use B8im\ImShared\Support\Constants;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
@@ -26,6 +28,16 @@ if ((int) $redis->dbSize() !== 0) {
 }
 
 $store = new RedisRealtimeEventStore($redis, 60, 1, 60);
+$publisher = new RedisRealtimeControlPublisher(
+    connector: static fn (): object => RedisRealtimeControlSocket::connect(
+        $host,
+        $port,
+        '',
+        0,
+        0.5,
+        0.5,
+    ),
+);
 $assertions = 0;
 $assert = static function (bool $condition, string $message) use (&$assertions): void {
     if (!$condition) {
@@ -48,7 +60,10 @@ $envelope = static function (string $name): string {
 
 try {
     $firstRaw = $envelope('dedup');
-    $redis->rPush(Constants::REDIS_REALTIME_EVENTS, $firstRaw, $firstRaw);
+    // Simulate a crash after RPUSH but before the MySQL published CAS: the
+    // reclaimed outbox row publishes the same event_id again.
+    $publisher->publish($firstRaw);
+    $publisher->publish($firstRaw);
     $first = $store->claim('redis-worker-a');
     $assert($first instanceof RealtimeEventClaim && $first->raw === $firstRaw, 'first event was not claimed');
     $assert($store->claim('redis-worker-b') === null, 'concurrent duplicate event was dispatched');

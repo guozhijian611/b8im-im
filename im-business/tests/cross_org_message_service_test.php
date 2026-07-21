@@ -19,6 +19,7 @@ use B8im\ImBusiness\Service\CrossOrganizationConversationAccess;
 use B8im\ImBusiness\Service\CrossOrganizationSocialPolicy;
 use B8im\ImBusiness\Service\ConversationSyncService;
 use B8im\ImBusiness\Service\DatabaseFriendRequestRealtimeAuthorizer;
+use B8im\ImBusiness\Service\FriendRequestRealtimeEvent;
 use B8im\ImBusiness\Service\MessageService;
 use B8im\ImBusiness\Service\OutboxService;
 use B8im\ImBusiness\Service\TenantImPolicyService;
@@ -27,6 +28,38 @@ use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Support\Constants;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
+
+function friendRealtimeCreatedEvent(
+    int $requestId,
+    int $fromOrganization,
+    string $fromUserId,
+    int $toOrganization,
+    string $toUserId,
+    ?string $snapshotId,
+    string $createTime,
+): FriendRequestRealtimeEvent {
+    $eventType = 'friend_request.created';
+    $eventId = hash('sha256', json_encode([
+        'friend_request.v1', $requestId, $eventType,
+        (string) $fromOrganization, $fromUserId,
+        (string) $toOrganization, $toUserId,
+        (string) $toOrganization, $toUserId, $snapshotId,
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+    return FriendRequestRealtimeEvent::fromRaw(json_encode([
+        'event_id' => $eventId,
+        'type' => 'friend_request',
+        'organization' => (string) $toOrganization,
+        'data' => [
+            'event' => 'created', 'request_id' => $requestId, 'status' => 1,
+            'from_organization' => (string) $fromOrganization, 'from_user_id' => $fromUserId,
+            'to_organization' => (string) $toOrganization, 'to_user_id' => $toUserId,
+            'target_organization' => (string) $toOrganization, 'target_user_id' => $toUserId,
+            'actor_organization' => (string) $fromOrganization, 'actor_user_id' => $fromUserId,
+            'cross_org_access_snapshot_id' => $snapshotId,
+            'create_time' => $createTime, 'handle_time' => null,
+        ],
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+}
 
 /**
  * The isolated integration suite runs without Gateway/Register processes.
@@ -1570,14 +1603,8 @@ $assert(
     'friend realtime user locks use canonical identity byte order for the 2/10 counterexample',
 );
 $currentFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '2',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '2', $now),
     static function () use (
         &$currentFriendDelivered,
         $assert,
@@ -2006,14 +2033,8 @@ $realtimeProvider->withDeliverableIdentities(
 );
 $assert($revokedRealtimeIdentities === [], 'revoke-before-delivery drops delayed message content');
 $revokedFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '2',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '2', $now),
     static function () use (&$revokedFriendDelivered): void {
         $revokedFriendDelivered = true;
     },
@@ -2122,14 +2143,8 @@ $assert(
     'old message epoch cannot cross a newer restored access snapshot',
 );
 $restoredOldFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '2',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '2', $now),
     static function () use (&$restoredOldFriendDelivered): void {
         $restoredOldFriendDelivered = true;
     },
@@ -2154,14 +2169,8 @@ $assert(
     'current restored epoch remains deliverable',
 );
 $restoredCurrentFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '4',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '4', $now),
     static function () use (&$restoredCurrentFriendDelivered): void {
         $restoredCurrentFriendDelivered = true;
     },
@@ -2249,14 +2258,8 @@ $realtimeProvider->withDeliverableIdentities(
 );
 $assert($inactiveRealtimeIdentities === [], 'inactive peer organization drops current message event');
 $inactiveFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '4',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '4', $now),
     static function () use (&$inactiveFriendDelivered): void {
         $inactiveFriendDelivered = true;
     },

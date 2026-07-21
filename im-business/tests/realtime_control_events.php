@@ -7,7 +7,9 @@ use B8im\ImBusiness\Service\RealtimeEventClaim;
 use B8im\ImBusiness\Service\RealtimeEventGatewayInterface;
 use B8im\ImBusiness\Service\RealtimeEventStoreInterface;
 use B8im\ImBusiness\Service\FriendRequestRealtimeAuthorizerInterface;
+use B8im\ImBusiness\Service\FriendRequestRealtimeEvent;
 use B8im\ImBusiness\Service\RedisRealtimeEventStore;
+use B8im\ImBusiness\Queue\RedisRealtimeControlPublisher;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
@@ -35,29 +37,67 @@ final class ControlFriendRequestAuthorizer implements FriendRequestRealtimeAutho
     {
     }
 
-    public function withCurrentRequest(
-        int $eventOrganization,
-        int $requestId,
-        int $fromOrganization,
-        string $fromUserId,
-        int $toOrganization,
-        string $toUserId,
-        ?string $crossOrgAccessSnapshotId,
-        callable $delivery,
-    ): void {
+    public function withCurrentEvent(FriendRequestRealtimeEvent $event, callable $delivery): void
+    {
         $this->calls[] = [
-            'event_organization' => $eventOrganization,
-            'request_id' => $requestId,
-            'from_organization' => $fromOrganization,
-            'from_user_id' => $fromUserId,
-            'to_organization' => $toOrganization,
-            'to_user_id' => $toUserId,
-            'cross_org_access_snapshot_id' => $crossOrgAccessSnapshotId,
+            'event' => $event->event,
+            'event_organization' => $event->targetOrganization,
+            'request_id' => $event->requestId,
+            'from_organization' => $event->fromOrganization,
+            'from_user_id' => $event->fromUserId,
+            'to_organization' => $event->toOrganization,
+            'to_user_id' => $event->toUserId,
+            'cross_org_access_snapshot_id' => $event->crossOrgAccessSnapshotId,
         ];
         if ($this->deliver) {
             $delivery();
         }
     }
+}
+
+function friendEnvelope(
+    string $transition,
+    int $requestId,
+    int $fromOrganization,
+    string $fromUserId,
+    int $toOrganization,
+    string $toUserId,
+    ?string $snapshotId,
+): string {
+    $handled = $transition !== 'created';
+    $targetOrganization = $handled ? $fromOrganization : $toOrganization;
+    $targetUserId = $handled ? $fromUserId : $toUserId;
+    $actorOrganization = $handled ? $toOrganization : $fromOrganization;
+    $actorUserId = $handled ? $toUserId : $fromUserId;
+    $eventType = 'friend_request.' . $transition;
+    $eventId = hash('sha256', json_encode([
+        'friend_request.v1', $requestId, $eventType,
+        (string) $fromOrganization, $fromUserId,
+        (string) $toOrganization, $toUserId,
+        (string) $targetOrganization, $targetUserId, $snapshotId,
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+
+    return json_encode([
+        'event_id' => $eventId,
+        'type' => 'friend_request',
+        'organization' => (string) $targetOrganization,
+        'data' => [
+            'event' => $transition,
+            'request_id' => $requestId,
+            'status' => ['created' => 1, 'accepted' => 2, 'rejected' => 3][$transition],
+            'from_organization' => (string) $fromOrganization,
+            'from_user_id' => $fromUserId,
+            'to_organization' => (string) $toOrganization,
+            'to_user_id' => $toUserId,
+            'target_organization' => (string) $targetOrganization,
+            'target_user_id' => $targetUserId,
+            'actor_organization' => (string) $actorOrganization,
+            'actor_user_id' => $actorUserId,
+            'cross_org_access_snapshot_id' => $snapshotId,
+            'create_time' => '2026-07-21 14:00:00',
+            'handle_time' => $handled ? '2026-07-21 14:01:00' : null,
+        ],
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
 }
 
 /** @return array<string, int|string> */
@@ -672,48 +712,47 @@ controlTest('malformed and legacy auth events are dropped without cross-tenant e
     controlAssert($store->processing === [] && $store->queue === []);
 });
 
-controlTest('friend requests retain their control-plane realtime behavior', static function (): void {
-    $store = new ControlTestStore();
-    $gateway = new ControlTestGateway();
-    $store->queue[] = controlEnvelope('friend_request.created', 7, [
-        'request_id' => 88,
-        'from_organization' => 7,
-        'from_user_id' => 'user-1',
-        'to_organization' => 7,
-        'to_user_id' => 'user-2',
-        'message' => 'hello',
-        'pending_count' => 1,
-        'create_time' => '2026-07-10 14:03:00',
-    ]);
-    (new RealtimeEventConsumer($store, $gateway))->consume();
+controlTest('created accepted and rejected use composite target identity', static function (): void {
+    foreach ([
+        ['created', 8, 'to-user', 'created'],
+        ['accepted', 7, 'from-user', 'accepted'],
+        ['rejected', 7, 'from-user', 'rejected'],
+    ] as [$transition, $targetOrganization, $targetUserId, $packetEvent]) {
+        $store = new ControlTestStore();
+        $gateway = new ControlTestGateway();
+        $authorizer = new ControlFriendRequestAuthorizer(true);
+        $store->queue[] = friendEnvelope(
+            $transition,
+            88,
+            7,
+            'from-user',
+            8,
+            'to-user',
+            '42',
+        );
 
-    controlAssert(count($gateway->sent) === 1);
-    controlAssert($gateway->sent[0][0] === 7 && $gateway->sent[0][1] === 'user-2');
-    controlAssert($gateway->sent[0][2]['cmd'] === 'friend_request');
-    controlAssert($gateway->sent[0][2]['data']['from_organization'] === 7);
-    controlAssert($gateway->sent[0][2]['data']['to_organization'] === 7);
-    controlAssert(!array_key_exists('cross_org_access_snapshot_id', $gateway->sent[0][2]['data']));
-    controlAssert(
-        $gateway->sent[0][2]['data']['event_id'] === json_decode($store->acked[0], true, flags: JSON_THROW_ON_ERROR)['event_id'],
-        'friend request packet must carry the stable control event id',
-    );
+        (new RealtimeEventConsumer(
+            $store,
+            $gateway,
+            friendRequestAuthorizer: $authorizer,
+        ))->consume();
+
+        controlAssert(count($authorizer->calls) === 1);
+        controlAssert(count($gateway->sent) === 1);
+        controlAssert($gateway->sent[0][0] === $targetOrganization);
+        controlAssert($gateway->sent[0][1] === $targetUserId);
+        controlAssert($gateway->sent[0][2]['organization'] === $targetOrganization);
+        controlAssert($gateway->sent[0][2]['data']['event'] === $packetEvent);
+        controlAssert(preg_match('/^[a-f0-9]{64}$/D', $gateway->sent[0][2]['data']['event_id']) === 1);
+        controlAssert(count($store->acked) === 1 && $store->requeued === []);
+    }
 });
 
-controlTest('stale cross-organization friend request converges without delivery or retry', static function (): void {
+controlTest('same organization requires null snapshot and current database authority', static function (): void {
     $store = new ControlTestStore();
     $gateway = new ControlTestGateway();
-    $authorizer = new ControlFriendRequestAuthorizer(false);
-    $store->queue[] = controlEnvelope('friend_request.created', 8, [
-        'cross_org_access_snapshot_id' => '41',
-        'request_id' => 89,
-        'from_organization' => 7,
-        'from_user_id' => 'user-1',
-        'to_organization' => 8,
-        'to_user_id' => 'user-2',
-        'message' => 'old request',
-        'pending_count' => 1,
-        'create_time' => '2026-07-10 14:03:00',
-    ]);
+    $authorizer = new ControlFriendRequestAuthorizer(true);
+    $store->queue[] = friendEnvelope('created', 89, 7, 'from-user', 7, 'to-user', null);
 
     (new RealtimeEventConsumer(
         $store,
@@ -722,60 +761,166 @@ controlTest('stale cross-organization friend request converges without delivery 
     ))->consume();
 
     controlAssert(count($authorizer->calls) === 1);
-    controlAssert($authorizer->calls[0]['cross_org_access_snapshot_id'] === '41');
+    controlAssert($authorizer->calls[0]['cross_org_access_snapshot_id'] === null);
+    controlAssert($gateway->sent[0][0] === 7 && $gateway->sent[0][1] === 'to-user');
+    controlAssert(array_key_exists('cross_org_access_snapshot_id', $gateway->sent[0][2]['data']));
+    controlAssert($gateway->sent[0][2]['data']['cross_org_access_snapshot_id'] === null);
+});
+
+controlTest('stale authoritative friend event is acknowledged without delivery or retry', static function (): void {
+    $store = new ControlTestStore();
+    $gateway = new ControlTestGateway();
+    $authorizer = new ControlFriendRequestAuthorizer(false);
+    $store->queue[] = friendEnvelope('accepted', 90, 7, 'from-user', 8, 'to-user', '43');
+
+    (new RealtimeEventConsumer(
+        $store,
+        $gateway,
+        friendRequestAuthorizer: $authorizer,
+    ))->consume();
+
+    controlAssert(count($authorizer->calls) === 1);
     controlAssert($gateway->sent === []);
     controlAssert(count($store->acked) === 1 && $store->requeued === [] && $store->processing === []);
 });
 
-controlTest('current cross-organization friend request is sent inside authorization callback', static function (): void {
+controlTest('hostile friend envelopes fail closed before database authorization', static function (): void {
+    $valid = json_decode(
+        friendEnvelope('created', 91, 7, 'from-user', 8, 'to-user', '44'),
+        true,
+        flags: JSON_THROW_ON_ERROR,
+    );
+    $hostile = [
+        'wrong envelope home' => [static function (array $event): array {
+            $event['organization'] = '7';
+            return $event;
+        }, 'home or time'],
+        'wrong created target' => [static function (array $event): array {
+            $event['data']['target_user_id'] = 'from-user';
+            return $event;
+        }, 'target or actor'],
+        'missing cross-org snapshot' => [static function (array $event): array {
+            $event['data']['cross_org_access_snapshot_id'] = null;
+            return $event;
+        }, 'no access snapshot'],
+        'extra data key' => [static function (array $event): array {
+            $event['data']['extra'] = true;
+            return $event;
+        }, 'shape is invalid'],
+        'forged event id' => [static function (array $event): array {
+            $event['event_id'] = str_repeat('0', 64);
+            return $event;
+        }, 'canonical tuple'],
+        'unsafe request id' => [static function (array $event): array {
+            $event['data']['request_id'] = 9007199254740992;
+            return $event;
+        }, 'transition is invalid'],
+        'overflow snapshot id' => [static function (array $event): array {
+            $event['data']['cross_org_access_snapshot_id'] = '18446744073709551616';
+            return $event;
+        }, 'no access snapshot'],
+        'pre-MySQL datetime year' => [static function (array $event): array {
+            $event['data']['create_time'] = '0000-01-01 00:00:00';
+            return $event;
+        }, 'home or time'],
+        'invalid calendar datetime' => [static function (array $event): array {
+            $event['data']['create_time'] = '2026-02-30 00:00:00';
+            return $event;
+        }, 'home or time'],
+        'same composite identity' => [static function (array $event): array {
+            $event['organization'] = '7';
+            $event['data']['to_organization'] = '7';
+            $event['data']['to_user_id'] = 'from-user';
+            $event['data']['target_organization'] = '7';
+            $event['data']['target_user_id'] = 'from-user';
+            $event['data']['cross_org_access_snapshot_id'] = null;
+            return $event;
+        }, 'identities must be distinct'],
+    ];
+
+    foreach ($hostile as $name => [$mutate, $expectedError]) {
+        $raw = json_encode($mutate($valid), JSON_THROW_ON_ERROR);
+        try {
+            FriendRequestRealtimeEvent::fromRaw($raw);
+            throw new RuntimeException($name . ' unexpectedly passed the strict friend parser');
+        } catch (InvalidArgumentException $error) {
+            controlAssert(
+                str_contains($error->getMessage(), $expectedError),
+                $name . ' failed at an unexpected parser boundary: ' . $error->getMessage(),
+            );
+        }
+
+        // Each hostile vector gets an isolated store. Reusing one store would
+        // let the first ACK put the shared event_id in the done set and hide
+        // later vectors behind Redis deduplication.
+        $store = new ControlTestStore();
+        $store->queue[] = $raw;
+        $gateway = new ControlTestGateway();
+        $authorizer = new ControlFriendRequestAuthorizer(true);
+        (new RealtimeEventConsumer(
+            $store,
+            $gateway,
+            friendRequestAuthorizer: $authorizer,
+        ))->consume();
+
+        controlAssert($authorizer->calls === [], $name . ' reached database authorization');
+        controlAssert($gateway->sent === [], $name . ' reached Gateway delivery');
+        controlAssert(
+            count($store->acked) === 1
+            && $store->queue === []
+            && $store->processing === []
+            && $store->requeued === [],
+            $name . ' was not independently ACK-dropped',
+        );
+    }
+});
+
+controlTest('friend event without database authorizer fails closed', static function (): void {
     $store = new ControlTestStore();
     $gateway = new ControlTestGateway();
-    $authorizer = new ControlFriendRequestAuthorizer(true);
-    $store->queue[] = controlEnvelope('friend_request.created', 8, [
-        'cross_org_access_snapshot_id' => '42',
-        'request_id' => 90,
-        'from_organization' => 7,
-        'from_user_id' => 'user-1',
-        'to_organization' => 8,
-        'to_user_id' => 'user-2',
-        'message' => 'current request',
-        'pending_count' => 1,
-        'create_time' => '2026-07-10 14:04:00',
-    ]);
+    $store->queue[] = friendEnvelope('created', 92, 7, 'from-user', 7, 'to-user', null);
 
-    (new RealtimeEventConsumer(
-        $store,
-        $gateway,
-        friendRequestAuthorizer: $authorizer,
-    ))->consume();
+    (new RealtimeEventConsumer($store, $gateway))->consume();
 
-    controlAssert(count($gateway->sent) === 1);
-    controlAssert($gateway->sent[0][0] === 8 && $gateway->sent[0][1] === 'user-2');
-    controlAssert($gateway->sent[0][2]['data']['cross_org_access_snapshot_id'] === '42');
-    controlAssert($gateway->sent[0][2]['data']['message'] === 'current request');
+    controlAssert($gateway->sent === []);
     controlAssert(count($store->acked) === 1 && $store->requeued === []);
 });
 
-controlTest('cross-organization friend request without epoch fails closed', static function (): void {
-    $store = new ControlTestStore();
-    $gateway = new ControlTestGateway();
-    $authorizer = new ControlFriendRequestAuthorizer(true);
-    $store->queue[] = controlEnvelope('friend_request.created', 8, [
-        'request_id' => 91,
-        'from_organization' => 7,
-        'from_user_id' => 'user-1',
-        'to_organization' => 8,
-        'to_user_id' => 'user-2',
-    ]);
+controlTest('Redis control publisher exposes RPUSH failure for durable retry', static function (): void {
+    $redis = new class() {
+        public function rPush(string $key, string $raw): false
+        {
+            return false;
+        }
+    };
+    try {
+        (new RedisRealtimeControlPublisher($redis))->publish(
+            friendEnvelope('created', 93, 7, 'from-user', 7, 'to-user', null),
+        );
+        throw new RuntimeException('Redis publisher silently accepted RPUSH failure');
+    } catch (RuntimeException $error) {
+        controlAssert(str_contains($error->getMessage(), 'RPUSH failed'));
+    }
+});
 
-    (new RealtimeEventConsumer(
-        $store,
-        $gateway,
-        friendRequestAuthorizer: $authorizer,
-    ))->consume();
-
-    controlAssert($authorizer->calls === [] && $gateway->sent === []);
-    controlAssert(count($store->acked) === 1 && $store->requeued === []);
+controlTest('Redis control publisher connects lazily and reconnects without startup coupling', static function (): void {
+    $connects = 0;
+    $publisher = new RedisRealtimeControlPublisher(connector: static function () use (&$connects): object {
+        ++$connects;
+        throw new RuntimeException('synthetic Redis connect failure');
+    });
+    controlAssert($connects === 0, 'constructor attempted a Redis connection');
+    foreach ([1, 2] as $attempt) {
+        try {
+            $publisher->publish(
+                friendEnvelope('created', 100 + $attempt, 7, 'from-user', 7, 'to-user', null),
+            );
+            throw new RuntimeException('lazy publisher hid a connection failure');
+        } catch (RuntimeException $error) {
+            controlAssert(str_contains($error->getMessage(), 'synthetic Redis connect failure'));
+        }
+        controlAssert($connects === $attempt, 'failed Redis connection was not retried on the next publish');
+    }
 });
 
 controlTest('organization inactive marker is bounded and enable clears it', static function (): void {

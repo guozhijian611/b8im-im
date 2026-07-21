@@ -118,8 +118,8 @@ final class RealtimeEventConsumer
             return;
         }
 
-        if (($event['type'] ?? '') === 'friend_request.created') {
-            $this->dispatchFriendRequestCreated($event);
+        if (($event['type'] ?? '') === 'friend_request') {
+            $this->dispatchFriendRequest($raw);
         }
     }
 
@@ -237,106 +237,27 @@ final class RealtimeEventConsumer
             && preg_match('/^[a-f0-9]{32}$/', $session['session_id']) === 1;
     }
 
-    private function dispatchFriendRequestCreated(array $event): void
+    private function dispatchFriendRequest(string $raw): void
     {
-        $organization = $event['organization'] ?? null;
-        $data = $event['data'] ?? null;
-        if (
-            !is_int($organization)
-            || $organization <= 0
-            || !is_array($data)
-            || array_is_list($data)
-        ) {
+        try {
+            $event = FriendRequestRealtimeEvent::fromRaw($raw);
+        } catch (\JsonException | \InvalidArgumentException) {
             return;
         }
-        $requestId = $data['request_id'] ?? null;
-        $fromOrganization = $data['from_organization'] ?? null;
-        $toOrganization = $data['to_organization'] ?? null;
-        $fromUserId = trim((string) ($data['from_user_id'] ?? ''));
-        $toUserId = trim((string) ($data['to_user_id'] ?? ''));
-        if (
-            !is_int($requestId)
-            || $requestId <= 0
-            || !is_int($fromOrganization)
-            || $fromOrganization <= 0
-            || !is_int($toOrganization)
-            || $toOrganization <= 0
-            || $organization !== $toOrganization
-            || $fromUserId === ''
-            || strlen($fromUserId) > 64
-            || $toUserId === ''
-            || strlen($toUserId) > 64
-            || ($fromOrganization === $toOrganization && hash_equals($fromUserId, $toUserId))
-        ) {
-            return;
-        }
-
-        $snapshotId = null;
-        if (array_key_exists('cross_org_access_snapshot_id', $data)) {
-            $candidate = $data['cross_org_access_snapshot_id'];
-            if (
-                !is_string($candidate)
-                || preg_match('/^[1-9][0-9]{0,19}$/D', $candidate) !== 1
-            ) {
-                return;
-            }
-            $snapshotId = $candidate;
-        }
-        $crossOrganization = $fromOrganization !== $toOrganization;
-        if (($crossOrganization && $snapshotId === null) || (!$crossOrganization && $snapshotId !== null)) {
-            return;
-        }
-
-        $deliver = function () use (
-            $event,
-            $organization,
-            $data,
-            $requestId,
-            $fromOrganization,
-            $fromUserId,
-            $toOrganization,
-            $toUserId,
-            $snapshotId,
-        ): void {
-            $this->gateway->sendToUser(
-                $organization,
-                $toUserId,
-                Packet::make(Command::FRIEND_REQUEST, [
-                    'event' => 'created',
-                    'event_id' => (string) $event['event_id'],
-                    'request_id' => $requestId,
-                    'from_organization' => $fromOrganization,
-                    'from_user_id' => $fromUserId,
-                    'to_organization' => $toOrganization,
-                    'to_user_id' => $toUserId,
-                    'message' => (string) ($data['message'] ?? ''),
-                    'pending_count' => (int) ($data['pending_count'] ?? 0),
-                    'create_time' => (string) ($data['create_time'] ?? ''),
-                    'from_user' => is_array($data['from_user'] ?? null) ? $data['from_user'] : null,
-                    ...($snapshotId !== null ? ['cross_org_access_snapshot_id' => $snapshotId] : []),
-                ], $organization)->encode(),
-            );
-        };
-
         if ($this->friendRequestAuthorizer === null) {
-            // Production always supplies the database authorizer. Keep the
-            // dependency optional only for same-organization unit fixtures;
-            // cross-organization events fail closed without it.
-            if (!$crossOrganization) {
-                $deliver();
-            }
             return;
         }
-        $this->friendRequestAuthorizer->withCurrentRequest(
-            $organization,
-            $requestId,
-            $fromOrganization,
-            $fromUserId,
-            $toOrganization,
-            $toUserId,
-            $snapshotId,
-            $deliver,
-        );
+        $this->friendRequestAuthorizer->withCurrentEvent($event, function () use ($event): void {
+            $this->gateway->sendToUser(
+                $event->targetOrganization,
+                $event->targetUserId,
+                Packet::make(
+                    Command::FRIEND_REQUEST,
+                    $event->packetData(),
+                    $event->targetOrganization,
+                )->encode(),
+            );
+        });
     }
 
 }
