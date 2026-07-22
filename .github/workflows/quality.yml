@@ -23,6 +23,10 @@ jobs:
       REDIS_DB: 0
       IM_EXPECT_DATABASE: nb8im_cross_org_ci
       IM_MESSAGE_SHARD_BUCKETS: 64
+      IM_TOKEN_SECRET: ci-group-access-token-secret-20260720-minimum-32-bytes
+      IM_GROUP_ACCESS_MIGRATION_MYSQL_TEST: 1
+      IM_MESSAGE_TIME_MIGRATION_MYSQL_TEST: 1
+      IM_SEARCH_SEQUENCE_MYSQL_TEST: 1
     services:
       mysql:
         image: mysql:8.0
@@ -46,9 +50,10 @@ jobs:
           --health-retries=10
     steps:
       - name: Checkout b8im-im
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: b8im-im
+          persist-credentials: false
 
       - name: Resolve locked b8im-im-shared reference
         id: shared_ref
@@ -82,11 +87,12 @@ jobs:
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout b8im-im-shared
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: guozhijian611/b8im-im-shared
           ref: ${{ steps.shared_ref.outputs.ref }}
           path: b8im-im-shared
+          persist-credentials: false
 
       - name: Verify locked b8im-im-shared checkout
         shell: bash
@@ -96,7 +102,7 @@ jobs:
           test "${actual}" = "${expected}"
 
       - name: Set up PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
           php-version: '8.2'
           extensions: mbstring, pdo_mysql, redis
@@ -161,6 +167,8 @@ jobs:
           grep -Fq '[PASS] same device connections coexist with exact session binding and cleanup' /tmp/im-business-test.log
           grep -Fq '192 passed, 0 failed' /tmp/im-business-test.log
           grep -Fq 'migration up succeeds again after destructive down' /tmp/im-business-test.log
+          grep -Fq 'Message create_time migration MySQL integration' /tmp/im-business-test.log
+          grep -Fq 'Search projection sequence MySQL integration' /tmp/im-business-test.log
 
       - name: Syntax-check register
         run: find b8im-im/im-register/src -name '*.php' -print0 | xargs -0 -n1 php -l

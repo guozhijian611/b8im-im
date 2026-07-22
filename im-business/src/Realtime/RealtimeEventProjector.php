@@ -6,6 +6,10 @@ namespace B8im\ImBusiness\Realtime;
 
 use B8im\ImBusiness\Service\CrossOrganizationSocialPolicy;
 use B8im\ImShared\Protocol\Command;
+use B8im\ImShared\Protocol\Dto\GroupMemberAccessChanged;
+use B8im\ImShared\Protocol\Dto\GroupMemberAccessEntry;
+use B8im\ImShared\Protocol\Dto\GroupMemberAccessPeriod;
+use B8im\ImShared\Protocol\Dto\CanonicalDecimal;
 use B8im\ImShared\Support\Constants;
 use JsonException;
 
@@ -25,6 +29,7 @@ final class RealtimeEventProjector
         Constants::MQ_ROUTING_MESSAGE_RECEIPT,
         Constants::MQ_ROUTING_CONVERSATION_READ,
         Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
+        Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
     ];
 
     public function project(string $routingKey, string $body): RealtimeEvent
@@ -55,6 +60,15 @@ final class RealtimeEventProjector
         $conversationType = $this->integer($payload, 'conversation_type', 1, 2);
         if ($eventType === Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED) {
             return $this->conversationAccessChanged(
+                $payload,
+                $eventId,
+                $organization,
+                $conversationId,
+                $conversationType,
+            );
+        }
+        if ($eventType === Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED) {
+            return $this->groupMemberAccessChanged(
                 $payload,
                 $eventId,
                 $organization,
@@ -239,6 +253,131 @@ final class RealtimeEventProjector
                 'peer_organization' => $peerOrganization,
                 'peer_user_id' => $peerUserId,
             ],
+        );
+    }
+
+    /** @param array<string,mixed> $payload */
+    private function groupMemberAccessChanged(
+        array $payload,
+        string $eventId,
+        int $organization,
+        string $conversationId,
+        int $conversationType,
+    ): RealtimeEvent {
+        if ($conversationType !== 2) {
+            throw new InvalidRealtimeEvent('group.member_access_changed only supports group chat');
+        }
+        $targetOrganization = $this->integer($payload, 'target_organization', 1);
+        $targetUserId = $this->string($payload, 'target_user_id', self::MAX_USER_ID_BYTES);
+        if ($targetOrganization !== $organization) {
+            throw new InvalidRealtimeEvent('group access target must belong to its home organization');
+        }
+        $accessSnapshotId = $this->positiveDecimal($payload, 'access_snapshot_id');
+        $accessVersion = $this->positiveDecimal($payload, 'access_version');
+        $lastMessageSeq = $this->nonNegativeDecimal($payload, 'last_message_seq');
+        $lastChangeSeq = $this->nonNegativeDecimal($payload, 'last_change_seq');
+        $accessState = $this->string($payload, 'access_state', 16);
+        $reason = $this->string($payload, 'reason', 64);
+        $actorOrganization = $this->integer($payload, 'actor_organization', 1);
+        $actorUserId = $this->string($payload, 'actor_user_id', self::MAX_USER_ID_BYTES);
+        $changedAt = $this->string($payload, 'created_at', 32);
+        $rawPeriods = $payload['periods'] ?? null;
+        if (!is_array($rawPeriods) || !array_is_list($rawPeriods)) {
+            throw new InvalidRealtimeEvent('periods must be a list');
+        }
+        $periods = [];
+        try {
+            foreach ($rawPeriods as $rawPeriod) {
+                if (!is_array($rawPeriod) || array_is_list($rawPeriod)) {
+                    throw new \InvalidArgumentException('period must be an object');
+                }
+                $periods[] = new GroupMemberAccessPeriod(
+                    is_string($rawPeriod['period_no'] ?? null) ? $rawPeriod['period_no'] : '',
+                    is_string($rawPeriod['from_seq'] ?? null) ? $rawPeriod['from_seq'] : '',
+                    array_key_exists('to_seq', $rawPeriod) && $rawPeriod['to_seq'] === null
+                        ? null
+                        : (is_string($rawPeriod['to_seq'] ?? null) ? $rawPeriod['to_seq'] : ''),
+                );
+            }
+            $entry = new GroupMemberAccessEntry(
+                $conversationId,
+                2,
+                $accessVersion,
+                $accessState,
+                $lastMessageSeq,
+                $lastChangeSeq,
+                $periods,
+            );
+            $changed = new GroupMemberAccessChanged(
+                $targetOrganization,
+                $targetUserId,
+                $accessSnapshotId,
+                $entry,
+                $reason,
+                $changedAt,
+            );
+        } catch (\InvalidArgumentException $exception) {
+            throw new InvalidRealtimeEvent('group access entry is invalid', previous: $exception);
+        }
+        $recipientIdentities = $this->identities($payload);
+        if ($recipientIdentities !== [[
+            'organization' => $targetOrganization,
+            'user_id' => $targetUserId,
+        ]]) {
+            throw new InvalidRealtimeEvent('group access recipient differs from its target identity');
+        }
+        if (
+            hash(
+                'sha256',
+                implode('|', [
+                    $organization,
+                    Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+                    $conversationId,
+                    $targetOrganization,
+                    $targetUserId,
+                    $accessSnapshotId,
+                    $accessVersion,
+                ]),
+            ) !== $eventId
+        ) {
+            throw new InvalidRealtimeEvent('group access event_id differs from its canonical identity');
+        }
+        $aggregateId = sha1(implode('|', [
+            $targetOrganization,
+            $targetUserId,
+            $conversationId,
+            $accessVersion,
+            $accessSnapshotId,
+        ]));
+
+        return $this->event(
+            eventId: $eventId,
+            eventType: Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+            organization: $organization,
+            conversationId: $conversationId,
+            conversationType: 2,
+            messageId: $aggregateId,
+            messageSeq: 0,
+            changeSeq: 0,
+            actorOrganization: $actorOrganization,
+            actorUserId: $actorUserId,
+            originOrganization: $actorOrganization,
+            originUserId: $actorUserId,
+            originClientId: '',
+            targetOrganization: $targetOrganization,
+            targetUserId: $targetUserId,
+            crossOrgAccessSnapshotId: null,
+            recipientIdentities: $recipientIdentities,
+            packetCommand: Command::GROUP_MEMBER_ACCESS_CHANGED,
+            packetData: [
+                'event_type' => Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+                ...$changed->toArray(),
+            ],
+            groupAccessSnapshotId: $accessSnapshotId,
+            groupAccessVersion: $accessVersion,
+            groupAccessState: $accessState,
+            groupLastMessageSeq: $lastMessageSeq,
+            groupLastChangeSeq: $lastChangeSeq,
         );
     }
 
@@ -563,6 +702,11 @@ final class RealtimeEventProjector
         array $recipientIdentities,
         string $packetCommand,
         array $packetData,
+        ?string $groupAccessSnapshotId = null,
+        ?string $groupAccessVersion = null,
+        ?string $groupAccessState = null,
+        ?string $groupLastMessageSeq = null,
+        ?string $groupLastChangeSeq = null,
     ): RealtimeEvent {
         return new RealtimeEvent(
             eventType: $eventType,
@@ -584,6 +728,11 @@ final class RealtimeEventProjector
             packetCommand: $packetCommand,
             packetData: $packetData,
             stableEventId: $eventId,
+            groupAccessSnapshotId: $groupAccessSnapshotId,
+            groupAccessVersion: $groupAccessVersion,
+            groupAccessState: $groupAccessState,
+            groupLastMessageSeq: $groupLastMessageSeq,
+            groupLastChangeSeq: $groupLastChangeSeq,
         );
     }
 
@@ -747,12 +896,23 @@ final class RealtimeEventProjector
 
     private function positiveDecimal(array $payload, string $key): string
     {
-        $value = $this->string($payload, $key, 20);
-        if (preg_match('/^[1-9][0-9]*$/', $value) !== 1) {
-            throw new InvalidRealtimeEvent($key . ' must be a positive decimal string');
+        try {
+            return CanonicalDecimal::positive($this->string($payload, $key, 20), $key);
+        } catch (\InvalidArgumentException $exception) {
+            throw new InvalidRealtimeEvent(
+                $key . ' must be a positive decimal string',
+                previous: $exception,
+            );
         }
+    }
 
-        return $value;
+    private function nonNegativeDecimal(array $payload, string $key): string
+    {
+        try {
+            return CanonicalDecimal::nonNegative($this->string($payload, $key, 20), $key);
+        } catch (\InvalidArgumentException $exception) {
+            throw new InvalidRealtimeEvent($key . ' must be a non-negative decimal string', previous: $exception);
+        }
     }
 
     private function optionalPositiveDecimal(array $payload, string $key): ?string

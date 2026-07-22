@@ -14,12 +14,27 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
         private readonly RealtimeRecipientProvider $recipients,
         private readonly RealtimeGateway $gateway,
         private readonly RealtimeDeliveryCheckpoint $checkpoints,
+        private readonly ?GroupMemberAccessRealtimeAuthorizer $groupAccessAuthorizer = null,
     ) {
     }
 
     public function deliver(RealtimeEvent $event): void
     {
         $this->assertHomeIdentities($event, $event->recipientIdentities, 'event');
+        if ($event->eventType === Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED) {
+            if ($this->groupAccessAuthorizer === null) {
+                throw new \RuntimeException('group access realtime authorizer is not configured');
+            }
+            if (!$this->gateway instanceof GroupMemberAccessSessionInvalidator) {
+                throw new \RuntimeException('group access session invalidator is not configured');
+            }
+            $this->assertAccessTarget($event);
+            $this->groupAccessAuthorizer->withCurrentEvent(
+                $event,
+                fn () => $this->deliverToIdentities($event, $event->recipientIdentities),
+            );
+            return;
+        }
         if ($event->eventType === Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED) {
             // The revocation notification itself must remain deliverable after
             // the policy transition. Its canonical local target was validated
@@ -74,6 +89,20 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
         );
     }
 
+    private function assertAccessTarget(RealtimeEvent $event): void
+    {
+        if (
+            $event->targetOrganization !== $event->organization
+            || $event->targetUserId === null
+            || $event->recipientIdentities !== [[
+                'organization' => $event->targetOrganization,
+                'user_id' => $event->targetUserId,
+            ]]
+        ) {
+            throw new \RuntimeException('access realtime target differs from its home projection');
+        }
+    }
+
     /** @param list<array{organization:int,user_id:string}> $identities */
     private function deliverToIdentities(RealtimeEvent $event, array $identities): void
     {
@@ -84,6 +113,15 @@ final class RealtimeDeliveryService implements RealtimeEventDeliverer
                 throw new \RuntimeException('realtime event recipient is outside its home projection');
             }
             foreach ($this->gateway->clientIdsForOrganizationUser($homeOrganization, $userId) as $clientId) {
+                if (
+                    $event->eventType === Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED
+                    && $event->groupAccessSnapshotId !== null
+                ) {
+                    $this->gateway->invalidateGroupAccessSnapshot(
+                        $clientId,
+                        $event->groupAccessSnapshotId,
+                    );
+                }
                 if ($clientId === $event->originClientId || $this->checkpoints->wasDelivered($event, $clientId)) {
                     continue;
                 }

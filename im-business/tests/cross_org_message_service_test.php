@@ -19,6 +19,7 @@ use B8im\ImBusiness\Service\CrossOrganizationConversationAccess;
 use B8im\ImBusiness\Service\CrossOrganizationSocialPolicy;
 use B8im\ImBusiness\Service\ConversationSyncService;
 use B8im\ImBusiness\Service\DatabaseFriendRequestRealtimeAuthorizer;
+use B8im\ImBusiness\Service\FriendRequestRealtimeEvent;
 use B8im\ImBusiness\Service\MessageService;
 use B8im\ImBusiness\Service\OutboxService;
 use B8im\ImBusiness\Service\TenantImPolicyService;
@@ -27,6 +28,38 @@ use B8im\ImShared\Protocol\Packet;
 use B8im\ImShared\Support\Constants;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
+
+function friendRealtimeCreatedEvent(
+    int $requestId,
+    int $fromOrganization,
+    string $fromUserId,
+    int $toOrganization,
+    string $toUserId,
+    ?string $snapshotId,
+    string $createTime,
+): FriendRequestRealtimeEvent {
+    $eventType = 'friend_request.created';
+    $eventId = hash('sha256', json_encode([
+        'friend_request.v1', $requestId, $eventType,
+        (string) $fromOrganization, $fromUserId,
+        (string) $toOrganization, $toUserId,
+        (string) $toOrganization, $toUserId, $snapshotId,
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+    return FriendRequestRealtimeEvent::fromRaw(json_encode([
+        'event_id' => $eventId,
+        'type' => 'friend_request',
+        'organization' => (string) $toOrganization,
+        'data' => [
+            'event' => 'created', 'request_id' => $requestId, 'status' => 1,
+            'from_organization' => (string) $fromOrganization, 'from_user_id' => $fromUserId,
+            'to_organization' => (string) $toOrganization, 'to_user_id' => $toUserId,
+            'target_organization' => (string) $toOrganization, 'target_user_id' => $toUserId,
+            'actor_organization' => (string) $fromOrganization, 'actor_user_id' => $fromUserId,
+            'cross_org_access_snapshot_id' => $snapshotId,
+            'create_time' => $createTime, 'handle_time' => null,
+        ],
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+}
 
 /**
  * The isolated integration suite runs without Gateway/Register processes.
@@ -142,9 +175,11 @@ $cleanup = static function () use (
             'im_message_user_delete',
             'im_message_receipt',
             'im_message_index',
+            'im_group_member_access_audit',
             'im_conversation_membership_period',
             'im_conversation_member',
             'im_conversation',
+            'im_user_group_access_state',
             'im_user_profile',
             'im_user_privacy_setting',
             'im_organization_message_sequence',
@@ -230,6 +265,12 @@ foreach ([
     $repository->execute(
         'INSERT INTO im_user_privacy_setting (organization, user_id, allow_add_by_mobile, allow_add_by_short_no, allow_add_by_username, create_time, update_time)
          VALUES (?, ?, 1, 1, 1, ?, ?)',
+        [$org, $uid, $now, $now],
+    );
+    $repository->execute(
+        'INSERT INTO im_user_group_access_state
+            (organization, user_id, access_snapshot_id, create_time, update_time)
+         VALUES (?, ?, 1, ?, ?)',
         [$org, $uid, $now, $now],
     );
     $repository->execute(
@@ -393,6 +434,30 @@ $context = static function (int $org, string $userId, ?string $clientId = null) 
         expireAt: time() + 3600,
         username: $userId,
     );
+};
+
+$currentGroupAccessSnapshot = static function (AuthContext $authContext) use ($repository): string {
+    $row = $repository->fetchOne(
+        'SELECT access_snapshot_id
+           FROM im_user_group_access_state
+          WHERE organization = ? AND user_id = ?
+          LIMIT 1',
+        [$authContext->organization, $authContext->userId],
+    );
+    $snapshotId = (string) ($row['access_snapshot_id'] ?? '');
+    if (preg_match('/^[1-9][0-9]*$/D', $snapshotId) !== 1) {
+        throw new RuntimeException('test user group access snapshot is not initialized');
+    }
+
+    return $snapshotId;
+};
+$syncMessages = static function (AuthContext $authContext, array $data) use (
+    &$messages,
+    $currentGroupAccessSnapshot,
+): array {
+    $data['access_snapshot_id'] = $currentGroupAccessSnapshot($authContext);
+
+    return $messages->sync($authContext, $data);
 };
 
 $blockedUpdate = static function (string $sql, array $params) use ($config): bool {
@@ -1200,7 +1265,7 @@ $assert(
         && ($editAck['content'] ?? null) === ['text' => 'edited-cross-org-service-test'],
     'edit ACK binds request, actor, conversation, message and normalized content',
 );
-$changeSync = $messages->sync($context($orgB, $userB), [
+$changeSync = $syncMessages($context($orgB, $userB), [
     'conversation_id' => $conversationId,
     'after_seq' => 3,
     'after_change_seq' => 0,
@@ -1538,14 +1603,8 @@ $assert(
     'friend realtime user locks use canonical identity byte order for the 2/10 counterexample',
 );
 $currentFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '2',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '2', $now),
     static function () use (
         &$currentFriendDelivered,
         $assert,
@@ -1640,7 +1699,7 @@ $badGroupOperations = [
         'status' => 'read',
         'client_msg_id' => 'bad-group-ack-' . $suffix,
     ]),
-    'SYNC' => static fn () => $messages->sync($context($orgA, $userA), [
+    'SYNC' => static fn () => $syncMessages($context($orgA, $userA), [
         'conversation_id' => $badGroupId,
         'after_global_seq' => '0',
     ]),
@@ -1974,14 +2033,8 @@ $realtimeProvider->withDeliverableIdentities(
 );
 $assert($revokedRealtimeIdentities === [], 'revoke-before-delivery drops delayed message content');
 $revokedFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '2',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '2', $now),
     static function () use (&$revokedFriendDelivered): void {
         $revokedFriendDelivered = true;
     },
@@ -2034,7 +2087,7 @@ $offOperations = [
         'conversation_id' => $conversationId,
         'client_msg_id' => 'off-screenshot-' . $suffix,
     ]),
-    'conversation_sync' => static fn () => $messages->sync($context($orgA, $userA), [
+    'conversation_sync' => static fn () => $syncMessages($context($orgA, $userA), [
         'conversation_id' => $conversationId,
         'after_global_seq' => '0',
     ]),
@@ -2065,7 +2118,7 @@ foreach ($offOperations as $operation => $invoke) {
     }
 }
 
-$globalAfterRevoke = $messages->sync($context($orgA, $userA), ['after_global_seq' => '0', 'limit' => 50]);
+$globalAfterRevoke = $syncMessages($context($orgA, $userA), ['after_global_seq' => '0', 'limit' => 50]);
 $globalAfterRevokeConversationIds = array_column(
     $globalAfterRevoke['messages'] ?? [],
     'conversation_id',
@@ -2090,14 +2143,8 @@ $assert(
     'old message epoch cannot cross a newer restored access snapshot',
 );
 $restoredOldFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '2',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '2', $now),
     static function () use (&$restoredOldFriendDelivered): void {
         $restoredOldFriendDelivered = true;
     },
@@ -2122,14 +2169,8 @@ $assert(
     'current restored epoch remains deliverable',
 );
 $restoredCurrentFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '4',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '4', $now),
     static function () use (&$restoredCurrentFriendDelivered): void {
         $restoredCurrentFriendDelivered = true;
     },
@@ -2217,14 +2258,8 @@ $realtimeProvider->withDeliverableIdentities(
 );
 $assert($inactiveRealtimeIdentities === [], 'inactive peer organization drops current message event');
 $inactiveFriendDelivered = false;
-$friendAuthorizer->withCurrentRequest(
-    $orgB,
-    $friendRequestId,
-    $orgA,
-    $userA,
-    $orgB,
-    $userB,
-    '4',
+$friendAuthorizer->withCurrentEvent(
+    friendRealtimeCreatedEvent($friendRequestId, $orgA, $userA, $orgB, $userB, '4', $now),
     static function () use (&$inactiveFriendDelivered): void {
         $inactiveFriendDelivered = true;
     },
@@ -2232,7 +2267,7 @@ $friendAuthorizer->withCurrentRequest(
 $assert(!$inactiveFriendDelivered, 'inactive peer organization drops current friend event');
 
 try {
-    $messages->sync($context($orgA, $userA), [
+    $syncMessages($context($orgA, $userA), [
         'conversation_id' => $conversationId,
         'after_global_seq' => '0',
     ]);
@@ -2243,7 +2278,7 @@ try {
         'inactive peer organization has access-revoked code',
     );
 }
-$globalAfterOrgDisable = $messages->sync(
+$globalAfterOrgDisable = $syncMessages(
     $context($orgA, $userA),
     ['after_global_seq' => '0', 'limit' => 50],
 );

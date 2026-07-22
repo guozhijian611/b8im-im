@@ -117,6 +117,23 @@ DB_NAME=nb8im_im_test IM_EXPECT_DATABASE=nb8im_im_test composer rollback
 URL-only 附件、嵌套合并转发和待重试 outbox，然后执行
 `20260710050000` 并验证旧 URL 全部清除。
 
+消息时间约束迁移会先完整枚举当前数据库的 `im_message_index`、模板表
+`im_message` 和所有严格匹配 `^im_message_[0-9]{4}_[0-9]{6}$` 的现存物理分片。
+任一目标缺少 `create_time` 或存在 NULL 时，会在首条 DDL 前失败并报告表名与
+NULL 行数；清理数据后可安全重跑。迁移成功后这三类表统一为
+`datetime NOT NULL`，未来 `CREATE TABLE ... LIKE im_message` 也继承非空约束。
+迁移与 `composer prebuild-shards` 共用 MySQL named lock，只用于串行化分片建表；
+它不会暂停 `SEND` 等业务写入。MySQL 对 `MODIFY COLUMN` 可能执行表重建或
+`ALGORITHM=COPY` 并持有较长 metadata lock，因此发布必须安排维护窗口：先完成
+数据库备份并停止/排空所有 `im-business` 写入，再执行 migration；迁移状态和全部
+目标列 shape 复核完成后才能恢复写入。不得把 named lock 当作在线无停写迁移保证。
+真实迁移契约使用随机 `nb8im_message_time_<random>_test` 隔离库：
+
+```bash
+cd im-business
+IM_MESSAGE_TIME_MIGRATION_MYSQL_TEST=1 composer test-message-time-migration
+```
+
 ## AUTH 信任域
 
 - IM 只接受 HS256 JWT，`iss` 必须是 `IM_TOKEN_TRUSTED_ISSUERS` 中的稳定 `deployment_id`，`aud` 必须包含 `IM_TOKEN_AUDIENCE=im`。

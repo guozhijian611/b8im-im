@@ -13,6 +13,10 @@ use B8im\ImBusiness\Realtime\RealtimeEventProjector;
 use B8im\ImBusiness\Realtime\RealtimeGateway;
 use B8im\ImBusiness\Realtime\RealtimeRecipientProvider;
 use B8im\ImBusiness\Realtime\RealtimeRetryCounter;
+use B8im\ImBusiness\Realtime\GroupMemberAccessRealtimeAuthorizer;
+use B8im\ImBusiness\Realtime\GroupMemberAccessSessionInvalidator;
+use B8im\ImBusiness\Realtime\DatabaseGroupMemberAccessRealtimeAuthorizer;
+use B8im\ImBusiness\Repository\GroupMemberAccessRepository;
 use B8im\ImShared\Protocol\Command;
 use B8im\ImShared\Support\Constants;
 
@@ -169,6 +173,32 @@ function mutationRealtimePayload(string $eventType): array
     }
 
     return $base;
+}
+
+/** @return array<string,mixed> */
+function groupAccessRealtimePayload(): array
+{
+    return [
+        'event_id' => 'c0be0c0c4fcabe60b7253511adcc1f07d327744ddd545889dfaa27930d95d686',
+        'event_type' => Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+        'organization' => 7,
+        'conversation_id' => 'group:7:alpha',
+        'conversation_type' => 2,
+        'target_organization' => 7,
+        'target_user_id' => 'member-1',
+        'access_snapshot_id' => '12',
+        'access_version' => '5',
+        'access_state' => 'revoked',
+        'last_message_seq' => '20',
+        'last_change_seq' => '3',
+        'periods' => [],
+        'reason' => 'history_revoke',
+        'actor_organization' => 7,
+        'actor_user_id' => 'admin-1',
+        'recipient_count' => 1,
+        'recipient_identities' => [['organization' => 7, 'user_id' => 'member-1']],
+        'created_at' => '2026-07-20 19:30:00',
+    ];
 }
 
 realtimeTest('created event projects the safe message and idempotency sequences', static function (): void {
@@ -557,6 +587,150 @@ realtimeTest('conversation access changes project both allowed states without me
     expectInvalidRealtime(static fn () => $projector->project(
         Constants::MQ_ROUTING_CONVERSATION_ACCESS_CHANGED,
         json_encode($invalid, JSON_THROW_ON_ERROR),
+    ));
+});
+
+realtimeTest('group access fixed vector is current-authorized, invalidates session pins and deduplicates', static function (): void {
+    $payload = groupAccessRealtimePayload();
+    $event = (new RealtimeEventProjector())->project(
+        Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+        json_encode($payload, JSON_THROW_ON_ERROR),
+    );
+    realtimeAssert($event->eventId() === 'c0be0c0c4fcabe60b7253511adcc1f07d327744ddd545889dfaa27930d95d686');
+    realtimeAssert($event->messageId === '86e88de917a2db16a4c35e82747aded6c42ac69d');
+    realtimeAssert($event->packetCommand === Command::GROUP_MEMBER_ACCESS_CHANGED);
+    $packet = json_decode($event->encodedPacket(), true, flags: JSON_THROW_ON_ERROR);
+    realtimeAssert($packet['data']['conversation_type'] === 2);
+    realtimeAssert($packet['data']['last_message_seq'] === '20');
+    realtimeAssert($packet['data']['last_change_seq'] === '3');
+    realtimeAssert($packet['data']['changed_at'] === '2026-07-20 19:30:00');
+    realtimeAssert(!array_key_exists('actor_organization', $packet['data']));
+    realtimeAssert(!array_key_exists('actor_user_id', $packet['data']));
+
+    $provider = new class() implements RealtimeRecipientProvider {
+        public int $calls = 0;
+        public function activeIdentities(int $organization, string $conversationId, int $messageSeq): array { ++$this->calls; return []; }
+        public function withDeliverableIdentities(RealtimeEvent $event, callable $delivery): void { ++$this->calls; $delivery([]); }
+    };
+    $gateway = new class() implements RealtimeGateway, GroupMemberAccessSessionInvalidator {
+        public array $invalidations = [];
+        public array $packets = [];
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array { return ['group-access-client']; }
+        public function invalidateGroupAccessSnapshot(string $clientId, string $currentSnapshotId): void { $this->invalidations[] = [$clientId, $currentSnapshotId]; }
+        public function sendToClient(string $clientId, string $packet): void { $this->packets[] = $packet; }
+    };
+    $checkpoints = new class() implements RealtimeDeliveryCheckpoint {
+        public array $seen = [];
+        public function wasDelivered(RealtimeEvent $event, string $clientId): bool { return isset($this->seen[$event->eventId() . ':' . $clientId]); }
+        public function markDelivered(RealtimeEvent $event, string $clientId): void { $this->seen[$event->eventId() . ':' . $clientId] = true; }
+    };
+    $authorizer = new class() implements GroupMemberAccessRealtimeAuthorizer {
+        public int $calls = 0;
+        public function withCurrentEvent(RealtimeEvent $event, callable $delivery): void { ++$this->calls; $delivery(); }
+    };
+    $delivery = new RealtimeDeliveryService($provider, $gateway, $checkpoints, $authorizer);
+    $delivery->deliver($event);
+    $delivery->deliver($event);
+    realtimeAssert($provider->calls === 0, 'group access event touched active-member gate');
+    realtimeAssert($authorizer->calls === 2);
+    realtimeAssert(count($gateway->invalidations) === 2, 'duplicate event did not keep session pin invalidated');
+    realtimeAssert(count($gateway->packets) === 1, 'delivery checkpoint did not suppress duplicate packet');
+
+    $staleAuthorizer = new class() implements GroupMemberAccessRealtimeAuthorizer {
+        public function withCurrentEvent(RealtimeEvent $event, callable $delivery): void {}
+    };
+    $staleGateway = new class() implements RealtimeGateway, GroupMemberAccessSessionInvalidator {
+        public int $calls = 0;
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array { ++$this->calls; return []; }
+        public function invalidateGroupAccessSnapshot(string $clientId, string $currentSnapshotId): void { ++$this->calls; }
+        public function sendToClient(string $clientId, string $packet): void { ++$this->calls; }
+    };
+    (new RealtimeDeliveryService($provider, $staleGateway, $checkpoints, $staleAuthorizer))->deliver($event);
+    realtimeAssert($staleGateway->calls === 0, 'stale access event reached Gateway');
+
+    $missingInvalidator = new class() implements RealtimeGateway {
+        public function clientIdsForOrganizationUser(int $organization, string $userId): array { return []; }
+        public function sendToClient(string $clientId, string $packet): void {}
+    };
+    try {
+        (new RealtimeDeliveryService($provider, $missingInvalidator, $checkpoints, $authorizer))->deliver($event);
+        throw new RuntimeException('expected missing session invalidator failure');
+    } catch (RuntimeException $exception) {
+        realtimeAssert(str_contains($exception->getMessage(), 'session invalidator'));
+    }
+});
+
+realtimeTest('group access authorizer holds the authority lock and rejects stale epochs', static function (): void {
+    $event = (new RealtimeEventProjector())->project(
+        Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+        json_encode(groupAccessRealtimePayload(), JSON_THROW_ON_ERROR),
+    );
+    $repository = new class() implements GroupMemberAccessRepository {
+        public bool $inTransaction = false;
+        public array $queries = [];
+        public array $state = ['access_snapshot_id' => '12'];
+        public array $member = [
+            'access_version' => '5',
+            'access_state' => 'revoked',
+        ];
+        public function transaction(callable $callback): mixed {
+            $this->inTransaction = true;
+            try { return $callback($this); } finally { $this->inTransaction = false; }
+        }
+        public function fetchOne(string $sql, array $params = []): ?array {
+            $this->queries[] = $sql;
+            if (str_contains($sql, 'FROM im_conversation_member')) { return $this->member; }
+            if (str_contains($sql, 'FROM im_user_group_access_state')) { return $this->state; }
+            if (str_contains($sql, 'FROM im_conversation')) { return ['conversation_id' => 'group:7:alpha']; }
+            return null;
+        }
+        public function fetchAll(string $sql, array $params = []): array { return []; }
+    };
+    $authorizer = new DatabaseGroupMemberAccessRealtimeAuthorizer($repository);
+    $deliveredInsideLock = false;
+    $authorizer->withCurrentEvent($event, static function () use ($repository, &$deliveredInsideLock): void {
+        $deliveredInsideLock = $repository->inTransaction;
+    });
+    realtimeAssert($deliveredInsideLock, 'current access event was not delivered inside its database lock');
+    realtimeAssert(count($repository->queries) === 3, 'access authorizer did not lock exactly three authority rows');
+    realtimeAssert(str_contains($repository->queries[0], 'FROM im_conversation') && str_contains($repository->queries[0], 'FOR UPDATE'), 'conversation was not locked first');
+    realtimeAssert(str_contains($repository->queries[1], 'FROM im_conversation_member') && str_contains($repository->queries[1], 'FOR UPDATE'), 'member was not locked second');
+    realtimeAssert(str_contains($repository->queries[2], 'FROM im_user_group_access_state') && str_contains($repository->queries[2], 'FOR UPDATE'), 'user snapshot was not locked last');
+    $repository->state['access_snapshot_id'] = '13';
+    $staleDelivered = false;
+    $authorizer->withCurrentEvent($event, static function () use (&$staleDelivered): void {
+        $staleDelivered = true;
+    });
+    realtimeAssert(!$staleDelivered, 'stale access epoch remained deliverable');
+});
+
+realtimeTest('group access projector rejects malformed state, bigint and identity tuples', static function (): void {
+    $projector = new RealtimeEventProjector();
+    foreach (['01', '18446744073709551616'] as $invalidDecimal) {
+        $payload = groupAccessRealtimePayload();
+        $payload['access_snapshot_id'] = $invalidDecimal;
+        expectInvalidRealtime(static fn () => $projector->project(
+            Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+            json_encode($payload, JSON_THROW_ON_ERROR),
+        ));
+    }
+    $payload = groupAccessRealtimePayload();
+    $payload['access_state'] = 'active';
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+        json_encode($payload, JSON_THROW_ON_ERROR),
+    ));
+    $payload = groupAccessRealtimePayload();
+    $payload['target_organization'] = 8;
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+        json_encode($payload, JSON_THROW_ON_ERROR),
+    ));
+    $payload = groupAccessRealtimePayload();
+    $payload['reason'] = 'unknown';
+    expectInvalidRealtime(static fn () => $projector->project(
+        Constants::MQ_ROUTING_GROUP_MEMBER_ACCESS_CHANGED,
+        json_encode($payload, JSON_THROW_ON_ERROR),
     ));
 });
 

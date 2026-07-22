@@ -119,6 +119,7 @@ try {
         'im_message_group',
         'im_conversation_membership_period',
         'im_message_change',
+        'im_realtime_control_outbox',
     ];
     foreach ($requiredTables as $requiredTable) {
         $table = $repository->fetchOne(
@@ -184,6 +185,25 @@ try {
         'traceparent',
         'tracestate',
     ], ['payload', 'next_retry_time', 'locked_time', 'published_time']);
+    $assertColumns('im_realtime_control_outbox', [
+        'event_id',
+        'aggregate_type',
+        'aggregate_id',
+        'event_type',
+        'organization',
+        'target_user_id',
+        'payload_json',
+        'traceparent',
+        'tracestate',
+        'status',
+        'retry_count',
+        'next_retry_at',
+        'locked_until',
+        'worker_id',
+        'claim_token',
+        'published_at',
+        'last_error',
+    ]);
 
     foreach ([$senderId, $recipientId, $otherId] as $userId) {
         $repository->execute(

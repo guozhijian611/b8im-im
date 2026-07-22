@@ -14,7 +14,10 @@ use PDOException;
 use Throwable;
 use B8im\ImBusiness\Service\ModuleLicenseRepositoryInterface;
 
-final class ImRepository implements MessageShardRepositoryInterface, ModuleLicenseRepositoryInterface
+final class ImRepository implements
+    MessageShardRepositoryInterface,
+    ModuleLicenseRepositoryInterface,
+    GroupMemberAccessRepository
 {
     private PDO $pdo;
     private int $transactionDepth = 0;
@@ -68,6 +71,11 @@ final class ImRepository implements MessageShardRepositoryInterface, ModuleLicen
     public function lastInsertId(): int
     {
         return (int) $this->pdo->lastInsertId();
+    }
+
+    public function inTransaction(): bool
+    {
+        return $this->transactionDepth > 0 && $this->pdo->inTransaction();
     }
 
     private function createPdo(): PDO

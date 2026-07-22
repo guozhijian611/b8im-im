@@ -65,6 +65,7 @@ function completeRuntimeTables(): array
         'im_message_user_delete',
         'im_message_change',
         'im_message_outbox',
+        'im_realtime_control_outbox',
         'sm_tenant_im_policy',
         'im_message',
         sprintf('im_message_0000_%s', date('Ym')),
@@ -81,10 +82,53 @@ $assert = static function (bool $condition, string $message) use (&$assertions):
     }
     ++$assertions;
 };
+$assertInvalid = static function (callable $callback, string $message) use (&$assertions): void {
+    try {
+        $callback();
+    } catch (InvalidArgumentException) {
+        ++$assertions;
+        return;
+    }
+
+    throw new RuntimeException($message);
+};
 
 $repository = new MessageShardRouterTestRepository(completeRuntimeTables());
 (new MessageShardRouter($repository, 1))->preflight();
 $assert(true, '完整运行时表被错误拒绝');
+
+$vectorTables = completeRuntimeTables();
+$vectorTables['im_message_0002_202607'] = true;
+$vectorRouter = new MessageShardRouter(new MessageShardRouterTestRepository($vectorTables), 64);
+$assert(
+    $vectorRouter->writeTable(7, 'single_abc', '2026-07-20 23:59:59') === 'im_message_0002_202607',
+    '路由未使用共享消息分片身份算法',
+);
+foreach ([0, -1, 1025] as $invalidBucketCount) {
+    $assertInvalid(
+        static fn (): MessageShardRouter => new MessageShardRouter($repository, $invalidBucketCount),
+        '非法分片桶配置未在路由构造时失败关闭',
+    );
+}
+foreach ([
+    '',
+    '2026-7-20 00:00:00',
+    '2026-02-29 00:00:00',
+    '2026-07-20 23:59:59 trailing',
+] as $invalidTime) {
+    $assertInvalid(
+        static fn (): string => $vectorRouter->writeTable(7, 'single_abc', $invalidTime),
+        '非法时间被路由回退为当前时间',
+    );
+}
+$assertInvalid(
+    static fn (): string => $vectorRouter->writeTable(0, 'single_abc', '2026-07-20 23:59:59'),
+    '非法 home organization 被路由接受',
+);
+$assertInvalid(
+    static fn (): string => $vectorRouter->writeTable(7, '', '2026-07-20 23:59:59'),
+    '非法 conversation ID 被路由接受',
+);
 
 foreach (['im_upload_asset', 'im_web_access_session', 'im_cross_organization_conversation', 'sm_tenant_im_policy'] as $missingTable) {
     $tables = completeRuntimeTables();

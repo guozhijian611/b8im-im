@@ -147,6 +147,7 @@ final class DatabaseRealtimeRecipientProvider implements RealtimeRecipientProvid
                 AND c.organization = ?
                 AND cm.conversation_id = ?
                 AND cm.status = 1
+                AND (c.conversation_type <> 2 OR cm.access_state = \'active\')
                 AND cm.delete_time IS NULL
                 AND EXISTS (
                     SELECT 1

@@ -12,6 +12,8 @@ use B8im\ImBusiness\Auth\AuthContext;
 use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Realtime\ConversationReadEventId;
 use B8im\ImBusiness\Repository\ImRepository;
+use B8im\ImShared\Protocol\Dto\CanonicalDecimal;
+use B8im\ImShared\Protocol\Dto\SearchProjectionEvent;
 use B8im\ImShared\Support\Constants;
 use B8im\ImBusiness\Telemetry\Telemetry;
 use OpenTelemetry\API\Trace\SpanKind;
@@ -251,6 +253,46 @@ final class OutboxService
         );
     }
 
+    /**
+     * Lock every organization search sequence before message body/change facts.
+     * Callers may pass cross-home organizations in any order; the database lock
+     * order is always ascending organization.
+     *
+     * @param list<int> $organizations
+     */
+    public function lockSearchProjectionSequences(array $organizations): void
+    {
+        if (!$this->repository->inTransaction()) {
+            throw new \RuntimeException(
+                'search projection sequence locks require the enclosing fact transaction',
+            );
+        }
+        $organizations = array_values(array_unique(array_map('intval', $organizations)));
+        sort($organizations, SORT_NUMERIC);
+        if ($organizations === [] || $organizations[0] <= 0) {
+            throw new \InvalidArgumentException('search projection organizations must be positive');
+        }
+
+        foreach ($organizations as $organization) {
+            $row = $this->repository->fetchOne(
+                'SELECT CAST(last_search_event_seq AS CHAR) AS last_search_event_seq
+                   FROM im_organization_message_sequence
+                  WHERE organization = ?
+                  FOR UPDATE',
+                [$organization],
+            );
+            if ($row === null) {
+                throw new \RuntimeException(
+                    'search projection sequence owner is missing for organization ' . $organization,
+                );
+            }
+            CanonicalDecimal::nonNegative(
+                (string) ($row['last_search_event_seq'] ?? ''),
+                'last_search_event_seq',
+            );
+        }
+    }
+
     /** @param array<string, mixed> $payload */
     private function insert(
         string $eventId,
@@ -276,14 +318,56 @@ final class OutboxService
                 $payload,
                 $now,
             ): int {
+                $isSearchProjection = in_array(
+                    $eventType,
+                    SearchProjectionEvent::EVENT_TYPES,
+                    true,
+                );
+                if ($isSearchProjection) {
+                    // This is intentionally repeated even when MessageService
+                    // already holds the row. It makes direct callers fail
+                    // closed and serializes duplicate event_id checks before
+                    // any source_event_seq allocation.
+                    $this->lockSearchProjectionSequences([$organization]);
+
+                    $existing = $this->existingEvent($eventId);
+                    if ($existing !== null) {
+                        $this->assertExistingIdentity(
+                            $existing,
+                            $organization,
+                            $eventType,
+                            $messageId,
+                            $changeSeq,
+                            $conversationId,
+                            $conversationType,
+                            true,
+                        );
+                        return 0;
+                    }
+                }
+
+                $sourceEventSeq = $isSearchProjection
+                    ? $this->allocateSearchProjectionSequence($organization)
+                    : null;
+                if ($sourceEventSeq !== null) {
+                    $payload = array_replace($payload, (new SearchProjectionEvent(
+                        $eventId,
+                        $organization,
+                        $eventType,
+                        $sourceEventSeq,
+                        $messageId,
+                    ))->toArray());
+                }
                 $trace = Telemetry::currentTraceContext();
-                return $this->repository->execute(
+                $inserted = $this->repository->execute(
                     'INSERT INTO im_message_outbox
-                        (event_id, organization, event_type, routing_key, message_id, change_seq,
+                        (event_id, organization, event_type, routing_key, message_id, change_seq, source_event_seq,
                          conversation_id, conversation_type, payload_json, traceparent, tracestate,
                          status, retry_count, next_retry_at, create_time, update_time)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-                     ON DUPLICATE KEY UPDATE event_id = VALUES(event_id)',
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)'
+                    . ($isSearchProjection
+                        ? ''
+                        : ' ON DUPLICATE KEY UPDATE event_id = VALUES(event_id)'),
                     [
                         $eventId,
                         $organization,
@@ -291,6 +375,7 @@ final class OutboxService
                         $eventType,
                         $messageId,
                         $changeSeq,
+                        $sourceEventSeq,
                         $conversationId,
                         $conversationType,
                         json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
@@ -302,6 +387,30 @@ final class OutboxService
                         $now,
                     ],
                 );
+                if ($isSearchProjection) {
+                    return $inserted;
+                }
+
+                // The upsert takes the unique event_id record lock without
+                // first acquiring a non-existent-key gap lock. Both concurrent
+                // identical writers may therefore succeed, after which the
+                // stored fact identity must still match exactly.
+                $existing = $this->existingEvent($eventId);
+                if ($existing === null) {
+                    throw new \RuntimeException('ordinary outbox event disappeared after idempotent upsert');
+                }
+                $this->assertExistingIdentity(
+                    $existing,
+                    $organization,
+                    $eventType,
+                    $messageId,
+                    $changeSeq,
+                    $conversationId,
+                    $conversationType,
+                    false,
+                );
+
+                return $inserted;
             },
             SpanKind::KIND_CLIENT,
             [
@@ -315,6 +424,116 @@ final class OutboxService
                 'messaging.destination.name' => $eventType,
             ],
         );
+    }
+
+    /** @return array<string,mixed>|null */
+    private function existingEvent(string $eventId): ?array
+    {
+        return $this->repository->fetchOne(
+            'SELECT event_id, organization, event_type, routing_key, message_id, change_seq,
+                    CAST(source_event_seq AS CHAR) AS source_event_seq,
+                    conversation_id, conversation_type, payload_json
+               FROM im_message_outbox
+              WHERE event_id = ?
+              LIMIT 1 FOR UPDATE',
+            [$eventId],
+        );
+    }
+
+    /** @param array<string,mixed> $existing */
+    private function assertExistingIdentity(
+        array $existing,
+        int $organization,
+        string $eventType,
+        string $messageId,
+        int $changeSeq,
+        string $conversationId,
+        int $conversationType,
+        bool $isSearchProjection,
+    ): void {
+        if (
+            (int) ($existing['organization'] ?? 0) !== $organization
+            || (string) ($existing['event_type'] ?? '') !== $eventType
+            || (string) ($existing['routing_key'] ?? '') !== $eventType
+            || (string) ($existing['message_id'] ?? '') !== $messageId
+            || (int) ($existing['change_seq'] ?? -1) !== $changeSeq
+            || (string) ($existing['conversation_id'] ?? '') !== $conversationId
+            || (int) ($existing['conversation_type'] ?? 0) !== $conversationType
+        ) {
+            throw new \RuntimeException('outbox event_id is already bound to a different fact identity');
+        }
+
+        $sourceEventSeq = $existing['source_event_seq'] ?? null;
+        if (!$isSearchProjection) {
+            if ($sourceEventSeq !== null) {
+                throw new \RuntimeException('non-search outbox event has a source_event_seq');
+            }
+            return;
+        }
+        if (!is_string($sourceEventSeq)) {
+            throw new \RuntimeException('search projection event has no source_event_seq');
+        }
+        $payload = json_decode(
+            (string) ($existing['payload_json'] ?? ''),
+            true,
+            flags: JSON_THROW_ON_ERROR,
+        );
+        if (!is_array($payload) || array_is_list($payload)) {
+            throw new \RuntimeException('search projection event payload is not an object');
+        }
+        $identity = new SearchProjectionEvent(
+            (string) $existing['event_id'],
+            $organization,
+            $eventType,
+            $sourceEventSeq,
+            $messageId,
+        );
+        foreach ($identity->toArray() as $field => $value) {
+            if (!array_key_exists($field, $payload) || $payload[$field] !== $value) {
+                throw new \RuntimeException(
+                    'search projection event payload identity differs from outbox columns: ' . $field,
+                );
+            }
+        }
+    }
+
+    private function allocateSearchProjectionSequence(int $organization): string
+    {
+        $row = $this->repository->fetchOne(
+            'SELECT CAST(last_search_event_seq AS CHAR) AS last_search_event_seq
+               FROM im_organization_message_sequence
+              WHERE organization = ?
+              FOR UPDATE',
+            [$organization],
+        );
+        if ($row === null) {
+            throw new \RuntimeException('search projection sequence owner is missing');
+        }
+        $current = CanonicalDecimal::nonNegative(
+            (string) ($row['last_search_event_seq'] ?? ''),
+            'last_search_event_seq',
+        );
+        try {
+            $next = CanonicalDecimal::increment($current, 'source_event_seq');
+        } catch (\InvalidArgumentException $exception) {
+            throw new \RuntimeException(
+                'search projection source_event_seq exhausted uint64',
+                0,
+                $exception,
+            );
+        }
+
+        $affected = $this->repository->execute(
+            'UPDATE im_organization_message_sequence
+                SET last_search_event_seq = ?, update_time = ?
+              WHERE organization = ? AND last_search_event_seq = ?',
+            [$next, $this->now(), $organization, $current],
+        );
+        if ($affected !== 1) {
+            throw new \RuntimeException('search projection sequence allocation lost its row lock');
+        }
+
+        return $next;
     }
 
     /** @param list<array{organization:int,user_id:string}> $identities */

@@ -45,6 +45,7 @@ final class MessageService
     private MessageShardRouter $messageShardRouter;
     private CrossOrganizationSocialPolicy $crossOrgSocial;
     private CrossOrganizationConversationAccess $conversationAccess;
+    private GroupMemberAccessSnapshotService $groupMemberAccess;
 
     public function __construct(
         private readonly ImRepository $repository,
@@ -53,11 +54,14 @@ final class MessageService
         private readonly TenantImPolicyService $tenantImPolicies,
         ?CrossOrganizationSocialPolicy $crossOrgSocial = null,
         ?CrossOrganizationConversationAccess $conversationAccess = null,
+        ?GroupMemberAccessSnapshotService $groupMemberAccess = null,
     ) {
         $this->messageShardRouter = new MessageShardRouter($repository, $config->messageShardBuckets);
         $this->crossOrgSocial = $crossOrgSocial ?? new CrossOrganizationSocialPolicy($repository);
         $this->conversationAccess = $conversationAccess
             ?? new CrossOrganizationConversationAccess($repository, $this->crossOrgSocial);
+        $this->groupMemberAccess = $groupMemberAccess
+            ?? new GroupMemberAccessSnapshotService($repository, $config->imTokenSecret);
     }
 
     public function preflight(): void
@@ -129,14 +133,12 @@ final class MessageService
                 'im.message.persist',
                 function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTables, $now): array {
                     return $this->repository->transaction(function () use ($context, $clientMsgId, $messageType, $content, $conversationType, $data, $messageTables, $now): array {
+                        $this->lockSearchProjectionOrganizations(array_keys($messageTables));
                         $conversation = $conversationType === self::CONVERSATION_SINGLE
                             ? $this->ensureSingleConversation($context, $data)
                             : $this->ensureGroupConversation($context, $data);
 
                         $homeOrganizations = $conversation['home_organizations'];
-                        foreach ($homeOrganizations as $homeOrganization) {
-                            $this->ensureOrganizationSequence($homeOrganization);
-                        }
                         $messageSeq = $this->allocateMessageSeq(
                             (string) $conversation['conversation_id'],
                             $homeOrganizations,
@@ -459,6 +461,7 @@ final class MessageService
             $conversationId,
             $accessPreview,
         ): array {
+            $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
             $homePolicies = $this->lockCrossHomeTenantPolicyBoundary(
                 $accessPreview['home_organizations'],
             );
@@ -615,6 +618,7 @@ final class MessageService
             $clientMsgId,
             $accessPreview,
         ): array {
+            $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
             $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
             $access = $this->conversationAccess->assertAccessible(
                 $context->organization,
@@ -699,6 +703,9 @@ final class MessageService
             $conversationId,
             $accessPreview,
         ): array {
+            if ($scope === 'both') {
+                $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
+            }
             $this->lockCrossHomeTenantPolicyBoundary($accessPreview['home_organizations']);
             $access = $this->conversationAccess->assertAccessible(
                 $context->organization,
@@ -877,6 +884,7 @@ final class MessageService
             $conversationId,
             $accessPreview,
         ): array {
+            $this->lockSearchProjectionOrganizations($accessPreview['home_organizations']);
             $homePolicies = $this->lockCrossHomeTenantPolicyBoundary(
                 $accessPreview['home_organizations'],
             );
@@ -1002,6 +1010,11 @@ final class MessageService
 
     public function sync(AuthContext $context, array $data): array
     {
+        $accessSnapshotId = $this->groupMemberAccess->assertCurrentSnapshot(
+            $context->organization,
+            $context->userId,
+            $data['access_snapshot_id'] ?? null,
+        );
         $limit = min(max((int) ($data['limit'] ?? 50), 1), $this->config->syncMaxLimit);
         $afterSeq = max((int) ($data['after_seq'] ?? 0), 0);
         $afterChangeSeq = max((int) ($data['after_change_seq'] ?? 0), 0);
@@ -1011,6 +1024,15 @@ final class MessageService
 
         if ($conversationId !== '') {
             $access = $this->conversationAccess->assertAccessible($context->organization, $conversationId);
+            $groupAccess = null;
+            if ((int) $access['conversation_type'] === self::CONVERSATION_GROUP) {
+                $groupAccess = $this->groupMemberAccess->assertConversationVersion(
+                    $context->organization,
+                    $context->userId,
+                    $conversationId,
+                    $data['access_version'] ?? null,
+                );
+            }
             $this->assertVisibleMember($context->organization, $conversationId, $context->userId);
             $messagePage = $this->fetchConversationMessages(
                 $context->organization,
@@ -1026,6 +1048,11 @@ final class MessageService
                 $afterChangeSeq,
                 $limit,
             );
+            $this->groupMemberAccess->assertCurrentSnapshot(
+                $context->organization,
+                $context->userId,
+                $accessSnapshotId,
+            );
 
             return [
                 'organization' => $context->organization,
@@ -1038,6 +1065,11 @@ final class MessageService
                 'messages_has_more' => $messagePage['has_more'],
                 'changes_has_more' => $changePage['has_more'],
                 'cross_org_access_snapshot_id' => $access['access_snapshot_id'],
+                'access_snapshot_id' => $accessSnapshotId,
+                ...($groupAccess === null ? [] : [
+                    'access_version' => $groupAccess->accessVersion,
+                    'access_state' => $groupAccess->accessState,
+                ]),
             ];
         }
 
@@ -1065,6 +1097,11 @@ final class MessageService
             );
         }
         $page = $stablePage;
+        $this->groupMemberAccess->assertCurrentSnapshot(
+            $context->organization,
+            $context->userId,
+            $accessSnapshotId,
+        );
 
         return [
             'organization' => $context->organization,
@@ -1073,6 +1110,7 @@ final class MessageService
             'next_after_global_seq' => (string) $page['next_after_global_seq'],
             'has_more' => $page['has_more'],
             'cross_org_access_snapshot_id' => $stableSnapshotId,
+            'access_snapshot_id' => $accessSnapshotId,
         ];
     }
 
@@ -1732,6 +1770,23 @@ final class MessageService
         }
     }
 
+    /** @param list<int> $homeOrganizations */
+    private function lockSearchProjectionOrganizations(array $homeOrganizations): void
+    {
+        $homeOrganizations = array_values(array_unique(array_map('intval', $homeOrganizations)));
+        sort($homeOrganizations, SORT_NUMERIC);
+        if ($homeOrganizations === [] || $homeOrganizations[0] <= 0) {
+            throw new ImException(
+                '搜索投影机构序号边界无效',
+                'SEARCH_PROJECTION_ORGANIZATION_INVALID',
+            );
+        }
+        foreach ($homeOrganizations as $homeOrganization) {
+            $this->ensureOrganizationSequence($homeOrganization);
+        }
+        $this->outbox->lockSearchProjectionSequences($homeOrganizations);
+    }
+
     /**
      * @param array<string, mixed> $message
      * @param array<string, mixed> $payload
@@ -2224,10 +2279,16 @@ final class MessageService
     private function assertMember(int $organization, string $conversationId, string $userId): void
     {
         $member = $this->repository->fetchOne(
-            'SELECT id, mute_status, mute_until FROM im_conversation_member
-              WHERE organization = ? AND conversation_id = ?
-                AND member_organization = ? AND user_id = ?
-                AND status = 1 AND delete_time IS NULL LIMIT 1',
+            'SELECT cm.id, cm.mute_status, cm.mute_until
+               FROM im_conversation_member cm
+               INNER JOIN im_conversation c
+                  ON c.organization = cm.organization
+                 AND c.conversation_id = cm.conversation_id
+              WHERE cm.organization = ? AND cm.conversation_id = ?
+                AND cm.member_organization = ? AND cm.user_id = ?
+                AND cm.status = 1
+                AND (c.conversation_type <> 2 OR cm.access_state = \'active\')
+                AND cm.delete_time IS NULL LIMIT 1',
             [$organization, $conversationId, $organization, $userId],
         );
         if ($member === null) {

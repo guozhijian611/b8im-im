@@ -10,8 +10,11 @@ namespace B8im\ImBusiness\Process;
 
 use B8im\ImBusiness\Config;
 use B8im\ImBusiness\Queue\RabbitMqPublisher;
+use B8im\ImBusiness\Queue\RedisRealtimeControlPublisher;
 use B8im\ImBusiness\Repository\ImRepository;
+use B8im\ImBusiness\Service\FriendRequestRealtimeEvent;
 use B8im\ImBusiness\Service\OutboxService;
+use B8im\ImBusiness\Service\RealtimeControlOutboxService;
 use Throwable;
 use Workerman\Timer;
 use B8im\ImBusiness\Telemetry\Telemetry;
@@ -22,6 +25,9 @@ final class OutboxPublisherProcess
 {
     private ?OutboxService $outbox = null;
     private ?RabbitMqPublisher $publisher = null;
+    private ?RealtimeControlOutboxService $controlOutbox = null;
+    private ?RedisRealtimeControlPublisher $controlPublisher = null;
+    private ?OutboxPublisherTickScheduler $scheduler = null;
     private bool $running = false;
 
     private string $workerId = '';
@@ -42,6 +48,12 @@ final class OutboxPublisherProcess
         $repository = ImRepository::connect($this->config);
         $this->outbox = new OutboxService($repository, $this->config);
         $this->publisher = new RabbitMqPublisher($this->config);
+        $this->controlOutbox = new RealtimeControlOutboxService(
+            $repository,
+            $this->config->mqOutboxLockTtlSeconds,
+        );
+        $this->controlPublisher = RedisRealtimeControlPublisher::connect($this->config);
+        $this->scheduler = new OutboxPublisherTickScheduler();
 
         Timer::add($this->config->mqOutboxIntervalMs / 1000, fn (): null => $this->tick());
         echo date('Y-m-d H:i:s') . " ImOutboxPublisher worker started\n";
@@ -49,7 +61,14 @@ final class OutboxPublisherProcess
 
     private function tick(): null
     {
-        if ($this->running || $this->outbox === null || $this->publisher === null) {
+        if (
+            $this->running
+            || $this->outbox === null
+            || $this->publisher === null
+            || $this->controlOutbox === null
+            || $this->controlPublisher === null
+            || $this->scheduler === null
+        ) {
             return null;
         }
 
@@ -59,10 +78,36 @@ final class OutboxPublisherProcess
             'retry_count' => 0,
         ]);
         try {
-            $rows = $this->outbox->claimPending($this->config->mqOutboxBatchSize, $this->workerId);
-            Telemetry::setAttributes($trace->span, ['b8im.outbox.claimed_count' => count($rows)]);
-            foreach ($rows as $row) {
-                $this->publishRow($row);
+            $result = $this->scheduler->run(
+                function () use ($trace): void {
+                    $rows = $this->outbox?->claimPending(
+                        $this->config->mqOutboxBatchSize,
+                        $this->workerId,
+                    ) ?? [];
+                    Telemetry::setAttributes($trace->span, [
+                        'b8im.outbox.claimed_count' => count($rows),
+                    ]);
+                    foreach ($rows as $row) {
+                        $this->publishRow($row);
+                    }
+                },
+                function (): bool {
+                    // One control row is the entire per-tick Redis budget. A
+                    // slow/broken Redis socket therefore cannot multiply its
+                    // bounded timeout by MQ_OUTBOX_BATCH_SIZE.
+                    $rows = $this->controlOutbox?->claimPending(1, $this->workerId) ?? [];
+
+                    return $rows === [] || $this->publishControlRow($rows[0]);
+                },
+            );
+            if ($result['control_error'] instanceof Throwable) {
+                echo date('Y-m-d H:i:s')
+                    . ' IM control outbox claim failed: error_code=IM_CONTROL_OUTBOX_CLAIM_FAILED '
+                    . Telemetry::logContext() . "\n";
+            }
+            $throwable = $result['rabbit_error'];
+            if ($throwable instanceof Throwable) {
+                throw $throwable;
             }
         } catch (Throwable $throwable) {
             Telemetry::recordError(
@@ -81,6 +126,51 @@ final class OutboxPublisherProcess
         }
 
         return null;
+    }
+
+    private function publishControlRow(array $row): bool
+    {
+        $id = (int) ($row['id'] ?? 0);
+        $token = (string) ($row['claim_token'] ?? '');
+        try {
+            if ($id <= 0 || preg_match('/^[a-f0-9]{40}$/D', $token) !== 1) {
+                throw new \RuntimeException('control outbox claim identity is invalid');
+            }
+            $event = FriendRequestRealtimeEvent::fromRaw((string) ($row['payload_json'] ?? ''));
+            if (
+                ($row['aggregate_type'] ?? null) !== 'friend_request'
+                || (int) ($row['aggregate_id'] ?? 0) !== $event->requestId
+                || !hash_equals((string) ($row['event_id'] ?? ''), $event->eventId)
+                || !hash_equals((string) ($row['event_type'] ?? ''), $event->event)
+                || (int) ($row['organization'] ?? 0) !== $event->targetOrganization
+                || !hash_equals((string) ($row['target_user_id'] ?? ''), $event->targetUserId)
+            ) {
+                throw new \RuntimeException('control outbox row differs from its immutable envelope');
+            }
+
+            // Renew immediately before the non-transactional RPUSH. A worker
+            // whose lease was reclaimed cannot publish or write a result.
+            $this->controlOutbox?->renew($id, $token);
+            $this->controlPublisher?->publish($event->raw);
+            $this->controlOutbox?->markPublished($id, $token);
+            return true;
+        } catch (Throwable $throwable) {
+            try {
+                $this->controlOutbox?->markFailed(
+                    $id,
+                    $token,
+                    'IM_REALTIME_CONTROL_PUBLISH_FAILED: ' . $throwable->getMessage(),
+                );
+            } catch (Throwable) {
+                echo date('Y-m-d H:i:s')
+                    . ' IM control outbox claim result ignored: error_code=IM_CONTROL_OUTBOX_CLAIM_STALE id='
+                    . $id . ' ' . Telemetry::logContext() . "\n";
+            }
+            echo date('Y-m-d H:i:s')
+                . ' IM control outbox publish failed: error_code=IM_REALTIME_CONTROL_PUBLISH_FAILED id='
+                . $id . ' ' . Telemetry::logContext() . "\n";
+            return false;
+        }
     }
 
     private function publishRow(array $row): void
@@ -119,7 +209,30 @@ final class OutboxPublisherProcess
                 throw new \RuntimeException('outbox payload is not an object');
             }
 
-            $messageId = 'im-outbox-' . $id . '-' . (string) $row['message_id'];
+            $searchIdentity = RabbitMqPublisher::searchProjectionIdentity($payload);
+            $rowSourceEventSeq = $row['source_event_seq'] ?? null;
+            if ($searchIdentity !== null) {
+                if (
+                    $searchIdentity->eventId !== (string) ($row['event_id'] ?? '')
+                    || $searchIdentity->organization !== (int) ($row['organization'] ?? 0)
+                    || $searchIdentity->eventType !== (string) ($row['event_type'] ?? '')
+                    || $searchIdentity->eventType !== (string) ($row['routing_key'] ?? '')
+                    || $searchIdentity->sourceEventSeq !== (string) $rowSourceEventSeq
+                    || $searchIdentity->messageId !== (string) ($row['message_id'] ?? '')
+                ) {
+                    throw new \RuntimeException(
+                        'search projection payload identity differs from the claimed outbox row',
+                    );
+                }
+            } elseif ($rowSourceEventSeq !== null) {
+                throw new \RuntimeException('non-search outbox row has a source_event_seq');
+            }
+
+            $messageId = RabbitMqPublisher::brokerMessageId(
+                $payload,
+                $id,
+                (string) $row['message_id'],
+            );
             $this->publisher?->publish(
                 (string) $row['routing_key'],
                 $payload,
