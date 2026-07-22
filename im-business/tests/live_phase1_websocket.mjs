@@ -34,6 +34,104 @@ function positiveDecimal(value, label) {
   return value
 }
 
+function nonNegativeDecimal(value, label) {
+  assert.equal(typeof value, 'string', label + ' must be a string')
+  assert.match(value, /^(0|[1-9][0-9]{0,19})$/, label + ' must be a canonical decimal')
+  assert.equal(BigInt(value) <= UINT64_MAX, true, label + ' exceeds uint64')
+  return value
+}
+
+function assertExactKeys(value, expected, label) {
+  assert.ok(value && typeof value === 'object' && !Array.isArray(value), label + ' must be an object')
+  assert.deepEqual(Object.keys(value).sort(), [...expected].sort(), label + ' schema changed')
+}
+
+function validateGroupAccessEntries(entries, previousConversationId = '') {
+  assert.ok(Array.isArray(entries), 'group access snapshot entries must be an array')
+  let previous = previousConversationId
+  for (const entry of entries) {
+    assertExactKeys(
+      entry,
+      [
+        'conversation_id',
+        'conversation_type',
+        'access_version',
+        'access_state',
+        'last_message_seq',
+        'last_change_seq',
+        'periods'
+      ],
+      'group access entry'
+    )
+    const conversationId = entry.conversation_id
+    assert.equal(typeof conversationId, 'string', 'group conversation_id must be a string')
+    assert.equal(conversationId.length > 0, true, 'group conversation_id must not be empty')
+    assert.equal(conversationId.trim(), conversationId, 'group conversation_id must be trimmed')
+    assert.equal(Buffer.byteLength(conversationId, 'utf8') <= 64, true, 'group conversation_id is too large')
+    assert.equal(conversationId.includes('\0'), false, 'group conversation_id contains NUL')
+    assert.equal(conversationId.includes('|'), false, 'group conversation_id contains a separator')
+    if (previous !== '') {
+      assert.equal(
+        Buffer.compare(Buffer.from(conversationId), Buffer.from(previous)) > 0,
+        true,
+        'group access entries must be strictly ordered'
+      )
+    }
+    previous = conversationId
+    assert.equal(entry.conversation_type, 2, 'group access entry conversation_type must be 2')
+    positiveDecimal(entry.access_version, 'group access_version')
+    assert.ok(
+      entry.access_state === 'active' || entry.access_state === 'history_only',
+      'group access_state must be visible'
+    )
+    nonNegativeDecimal(entry.last_message_seq, 'group last_message_seq')
+    nonNegativeDecimal(entry.last_change_seq, 'group last_change_seq')
+    assert.ok(Array.isArray(entry.periods) && entry.periods.length > 0, 'visible group access needs periods')
+
+    let previousPeriodNo = null
+    let previousToSeq = null
+    let openPeriods = 0
+    for (const period of entry.periods) {
+      assertExactKeys(period, ['period_no', 'from_seq', 'to_seq'], 'group access period')
+      const periodNo = positiveDecimal(period.period_no, 'group period_no')
+      const fromSeq = positiveDecimal(period.from_seq, 'group from_seq')
+      const toSeq = period.to_seq === null
+        ? null
+        : positiveDecimal(period.to_seq, 'group to_seq')
+      if (toSeq === null) {
+        openPeriods += 1
+      } else {
+        assert.equal(BigInt(toSeq) >= BigInt(fromSeq), true, 'group period ends before it starts')
+      }
+      if (previousPeriodNo !== null) {
+        assert.equal(BigInt(periodNo) > BigInt(previousPeriodNo), true, 'group period_no is not increasing')
+        assert.notEqual(previousToSeq, null, 'an open group period must be terminal')
+        assert.equal(BigInt(fromSeq) > BigInt(previousToSeq), true, 'group access periods overlap')
+      }
+      previousPeriodNo = periodNo
+      previousToSeq = toSeq
+    }
+    assert.equal(
+      openPeriods,
+      entry.access_state === 'active' ? 1 : 0,
+      'group access_state differs from its periods'
+    )
+  }
+  return previous
+}
+
+function isAccessSnapshotRetryError(packet) {
+  return packet.cmd === 'error' && [
+    'ACCESS_SNAPSHOT_STALE',
+    'ACCESS_SNAPSHOT_NOT_COMPLETED'
+  ].includes(packet.data?.code)
+}
+
+function isCrossOrgSyncRetryError(packet) {
+  return packet.cmd === 'error'
+    && packet.data?.code === 'CROSS_ORG_ACCESS_SNAPSHOT_UNSTABLE'
+}
+
 const SUCCESS_TRACEPARENT = process.env.B8IM_TRACEPARENT ?? newTraceparent()
 const SUCCESS_TRACE_ID = traceIdOf(SUCCESS_TRACEPARENT)
 const CROSS_TENANT_TRACEPARENT = newTraceparent()
@@ -260,9 +358,12 @@ class Peer {
 }
 
 async function completeGroupAccessSnapshot(peer, organization, authSnapshotId) {
-  let snapshotId = null
-  let cursor = null
-  for (let page = 0; page < 100; page += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    let snapshotId = null
+    let cursor = null
+    let previousConversationId = ''
+    let restart = false
+    for (let page = 0; page < 100; page += 1) {
     const requestId = qaClientMessageId('group-access-' + page)
     peer.send({
       cmd: 'group_member_access_snapshot',
@@ -279,13 +380,17 @@ async function completeGroupAccessSnapshot(peer, organization, authSnapshotId) {
         && packet.client_msg_id === requestId,
       'GROUP_MEMBER_ACCESS_SNAPSHOT_ACK'
     )
+    assert.equal(acknowledgement.organization, organization)
+    assert.equal(acknowledgement.client_msg_id, requestId)
+    if (isAccessSnapshotRetryError(acknowledgement)) {
+      restart = true
+      break
+    }
     assert.equal(
       acknowledgement.cmd,
       'group_member_access_snapshot_ack',
       JSON.stringify(acknowledgement)
     )
-    assert.equal(Number(acknowledgement.organization), organization)
-    assert.equal(acknowledgement.client_msg_id, requestId)
     const data = acknowledgement.data ?? {}
     assert.deepEqual(
       Object.keys(data).sort(),
@@ -306,7 +411,7 @@ async function completeGroupAccessSnapshot(peer, organization, authSnapshotId) {
     } else {
       assert.equal(pageSnapshotId, snapshotId, 'group access snapshot changed within a page chain')
     }
-    assert.ok(Array.isArray(data.entries), 'group access snapshot entries must be an array')
+    previousConversationId = validateGroupAccessEntries(data.entries, previousConversationId)
     assert.equal(
       data.entries.length <= GROUP_ACCESS_PAGE_LIMIT,
       true,
@@ -331,8 +436,12 @@ async function completeGroupAccessSnapshot(peer, organization, authSnapshotId) {
     )
     assert.equal(data.next_cursor.includes('\0'), false, 'group access snapshot cursor contains NUL')
     cursor = data.next_cursor
+    }
+    if (!restart) {
+      throw new Error('group access snapshot page limit exceeded')
+    }
   }
-  throw new Error('group access snapshot page limit exceeded')
+  throw new Error('group access snapshot changed too many times')
 }
 
 async function authenticate(peer, organization, webToken, deviceId) {
@@ -362,7 +471,7 @@ async function authenticate(peer, organization, webToken, deviceId) {
     'AUTH_ACK'
   )
   assert.equal(acknowledgement.cmd, 'auth_ack', JSON.stringify(acknowledgement))
-  assert.equal(Number(acknowledgement.organization), organization)
+  assert.equal(acknowledgement.organization, organization)
   assert.equal(acknowledgement.data?.client_id, clientId)
   assert.equal(acknowledgement.data?.device_id, deviceId)
   assert.equal(acknowledgement.data?.credential_session_id, claims.session_id)
@@ -390,44 +499,147 @@ async function takeSendAcknowledgement(peer, clientMessageId, label) {
   return packet
 }
 
+function validateGlobalSyncPage(
+  acknowledgement,
+  { organization, requestId, cursor, accessSnapshotId, limit }
+) {
+  assert.equal(acknowledgement.cmd, 'sync_ack', JSON.stringify(acknowledgement))
+  assert.equal(acknowledgement.client_msg_id, requestId)
+  assert.equal(acknowledgement.organization, organization)
+  const data = acknowledgement.data ?? {}
+  assertExactKeys(
+    data,
+    [
+      'organization',
+      'scope',
+      'messages',
+      'next_after_global_seq',
+      'has_more',
+      'cross_org_access_snapshot_id',
+      'access_snapshot_id'
+    ],
+    'SYNC_ACK data'
+  )
+  assert.equal(data.organization, organization)
+  assert.equal(data.scope, 'global')
+  assert.equal(data.access_snapshot_id, accessSnapshotId)
+  nonNegativeDecimal(data.cross_org_access_snapshot_id, 'SYNC_ACK cross_org_access_snapshot_id')
+  const next = nonNegativeDecimal(data.next_after_global_seq, 'SYNC_ACK next_after_global_seq')
+  nonNegativeDecimal(cursor, 'SYNC request cursor')
+  assert.ok(Array.isArray(data.messages), 'SYNC_ACK messages must be an array')
+  assert.equal(data.messages.length <= limit, true, 'SYNC_ACK exceeded the requested page limit')
+  assert.equal(typeof data.has_more, 'boolean', 'SYNC_ACK has_more must be boolean')
+  assert.equal(BigInt(next) >= BigInt(cursor), true, 'SYNC_ACK cursor regressed')
+  if (data.has_more) {
+    assert.equal(BigInt(next) > BigInt(cursor), true, 'SYNC_ACK continuation cursor did not advance')
+  }
+
+  let previousGlobalSeq = BigInt(cursor)
+  for (const message of data.messages) {
+    assert.ok(message && typeof message === 'object' && !Array.isArray(message), 'SYNC message must be an object')
+    assert.equal(message.organization, organization, 'SYNC message organization changed')
+    const globalSeq = positiveDecimal(message.global_seq, 'SYNC message global_seq')
+    assert.equal(BigInt(globalSeq) > previousGlobalSeq, true, 'SYNC messages are not strictly ordered')
+    assert.equal(BigInt(globalSeq) <= BigInt(next), true, 'SYNC message exceeds the response cursor')
+    previousGlobalSeq = BigInt(globalSeq)
+  }
+  return data
+}
+
 async function syncFromZero(peer, organization, accessSnapshotId, messageId) {
-  let cursor = '0'
-  for (let page = 0; page < 100; page += 1) {
-    const requestId = qaClientMessageId('sync-' + page)
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    let cursor = '0'
+    let crossOrgSnapshotId = null
+    let restart = false
+    for (let page = 0; page < 100; page += 1) {
+      const requestId = qaClientMessageId('sync-' + attempt + '-' + page)
+      peer.send({
+        cmd: 'sync',
+        organization: FORGED_ORGANIZATION,
+        client_msg_id: requestId,
+        data: {
+          after_global_seq: cursor,
+          access_snapshot_id: accessSnapshotId,
+          limit: 100
+        }
+      })
+      const acknowledgement = await peer.take(
+        (packet) => (packet.cmd === 'sync_ack' || packet.cmd === 'error')
+          && packet.client_msg_id === requestId,
+        'SYNC_ACK'
+      )
+      assert.equal(acknowledgement.organization, organization)
+      assert.equal(acknowledgement.client_msg_id, requestId)
+      if (isAccessSnapshotRetryError(acknowledgement)) {
+        accessSnapshotId = await completeGroupAccessSnapshot(
+          peer,
+          organization,
+          accessSnapshotId
+        )
+        restart = true
+        break
+      }
+      if (isCrossOrgSyncRetryError(acknowledgement)) {
+        restart = true
+        break
+      }
+      const data = validateGlobalSyncPage(
+        acknowledgement,
+        { organization, requestId, cursor, accessSnapshotId, limit: 100 }
+      )
+      if (crossOrgSnapshotId === null) {
+        crossOrgSnapshotId = data.cross_org_access_snapshot_id
+      } else if (data.cross_org_access_snapshot_id !== crossOrgSnapshotId) {
+        restart = true
+        break
+      }
+      const found = data.messages.find((message) => message.message_id === messageId)
+      if (found) {
+        return { message: found, accessSnapshotId }
+      }
+      assert.equal(data.has_more, true, 'message ' + messageId + ' not found')
+      cursor = data.next_after_global_seq
+    }
+    if (!restart) {
+      throw new Error('SYNC page limit exceeded')
+    }
+  }
+  throw new Error('SYNC snapshot changed too many times')
+}
+
+async function expectInvalidGlobalSync(peer, organization, accessSnapshotId) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const requestId = qaClientMessageId('invalid-sync-' + attempt)
     peer.send({
       cmd: 'sync',
       organization: FORGED_ORGANIZATION,
       client_msg_id: requestId,
       data: {
-        after_global_seq: cursor,
+        after_global_seq: 0,
         access_snapshot_id: accessSnapshotId,
-        limit: 100
+        limit: 20
       }
     })
-    const acknowledgement = await peer.take(
-      (packet) => (packet.cmd === 'sync_ack' || packet.cmd === 'error')
-        && packet.client_msg_id === requestId,
-      'SYNC_ACK'
+    const packet = await peer.take(
+      (candidate) => (candidate.cmd === 'sync_ack' || candidate.cmd === 'error')
+        && candidate.client_msg_id === requestId,
+      'SYNC_GLOBAL_SEQ_INVALID'
     )
-    assert.equal(acknowledgement.cmd, 'sync_ack', JSON.stringify(acknowledgement))
-    assert.equal(acknowledgement.client_msg_id, requestId)
-    assert.equal(Number(acknowledgement.organization), organization)
-    assert.equal(acknowledgement.data?.scope, 'global')
-    assert.equal(acknowledgement.data?.access_snapshot_id, accessSnapshotId)
-    assert.ok(Array.isArray(acknowledgement.data?.messages), 'SYNC_ACK messages must be an array')
-    assert.equal(typeof acknowledgement.data?.has_more, 'boolean', 'SYNC_ACK has_more must be boolean')
-    const found = acknowledgement.data.messages.find(
-      (message) => message.message_id === messageId
-    )
-    if (found) {
-      return found
+    assert.equal(packet.organization, organization)
+    assert.equal(packet.client_msg_id, requestId)
+    if (isAccessSnapshotRetryError(packet)) {
+      accessSnapshotId = await completeGroupAccessSnapshot(
+        peer,
+        organization,
+        accessSnapshotId
+      )
+      continue
     }
-    assert.equal(acknowledgement.data.has_more, true, `message ${messageId} not found`)
-    const next = String(acknowledgement.data.next_after_global_seq)
-    assert.notEqual(next, cursor)
-    cursor = next
+    assert.equal(packet.cmd, 'error', JSON.stringify(packet))
+    assert.equal(packet.data?.code, 'SYNC_GLOBAL_SEQ_INVALID')
+    return { packet, accessSnapshotId }
   }
-  throw new Error('SYNC page limit exceeded')
+  throw new Error('invalid SYNC probe snapshot changed too many times')
 }
 
 const deviceA = device('alice')
@@ -553,7 +765,9 @@ try {
     ),
     alice.take(
       (packet) => packet.cmd === 'ack'
-        && packet.data?.message_id === message.message_id,
+        && packet.data?.message_id === message.message_id
+        && packet.data?.client_msg_id === deliveredAckClientMessageId
+        && packet.data?.request_client_msg_id === deliveredAckClientMessageId,
       'sender ACK'
     )
   ])
@@ -564,6 +778,10 @@ try {
   assert.equal(ackAcknowledgement.data?.message_id, message.message_id)
   assert.equal(ackAcknowledgement.data.status, 'delivered')
   assert.equal(Number(senderAck.organization), ORGANIZATION)
+  assert.equal(senderAck.client_msg_id ?? null, null)
+  assert.equal(senderAck.data?.client_msg_id, deliveredAckClientMessageId)
+  assert.equal(senderAck.data?.request_client_msg_id, deliveredAckClientMessageId)
+  assert.equal(senderAck.data?.status, 'delivered')
 
   const duplicateAckClientMessageId = qaClientMessageId('ack-duplicate')
   bob.send({
@@ -643,22 +861,13 @@ try {
   assert.equal(crossTenantError.data?.code, 'SEND_SINGLE_RECEIVER_INVALID')
   assert.equal(traceIdOf(crossTenantError.traceparent), CROSS_TENANT_TRACE_ID)
 
-  const invalidSyncId = `phase1-bad-sync-${randomUUID()}`
-  bob.send({
-    cmd: 'sync',
-    organization: FORGED_ORGANIZATION,
-    client_msg_id: invalidSyncId,
-    data: {
-      after_global_seq: 0,
-      access_snapshot_id: bobAuth.accessSnapshotId,
-      limit: 20
-    }
-  })
-  const invalidSync = await bob.take(
-    (packet) => packet.cmd === 'error' && packet.client_msg_id === invalidSyncId,
-    'SYNC_GLOBAL_SEQ_INVALID'
+  const invalidSyncResult = await expectInvalidGlobalSync(
+    bob,
+    ORGANIZATION,
+    bobAuth.accessSnapshotId
   )
-  assert.equal(invalidSync.data?.code, 'SYNC_GLOBAL_SEQ_INVALID')
+  const invalidSync = invalidSyncResult.packet
+  manifest.bob_access_snapshot_id = invalidSyncResult.accessSnapshotId
 
   bob.send({ cmd: 'ping', organization: FORGED_ORGANIZATION, data: {} })
   const pong = await bob.take((packet) => packet.cmd === 'pong', 'PONG after error')
@@ -709,24 +918,29 @@ try {
     sessionB.token,
     deviceB
   )
-  manifest.reconnected_bob_access_snapshot_id = reconnectedBobAuth.accessSnapshotId
-  const synced = await syncFromZero(
+  let reconnectedBobAccessSnapshotId = reconnectedBobAuth.accessSnapshotId
+  let syncResult = await syncFromZero(
     reconnectedBob,
     ORGANIZATION,
-    reconnectedBobAuth.accessSnapshotId,
+    reconnectedBobAccessSnapshotId,
     message.message_id
   )
+  reconnectedBobAccessSnapshotId = syncResult.accessSnapshotId
+  const synced = syncResult.message
   assert.equal(synced.global_seq, message.global_seq)
   for (const offlineMessage of offlineMessages) {
-    const recovered = await syncFromZero(
+    syncResult = await syncFromZero(
       reconnectedBob,
       ORGANIZATION,
-      reconnectedBobAuth.accessSnapshotId,
+      reconnectedBobAccessSnapshotId,
       offlineMessage.message_id
     )
+    reconnectedBobAccessSnapshotId = syncResult.accessSnapshotId
+    const recovered = syncResult.message
     assert.equal(recovered.global_seq, offlineMessage.global_seq)
     assert.equal(recovered.message_seq, offlineMessage.message_seq)
   }
+  manifest.reconnected_bob_access_snapshot_id = reconnectedBobAccessSnapshotId
 
   let adminSessionRevoke = false
   if (process.env.ADMIN_REVOKE_CHECK === '1') {
