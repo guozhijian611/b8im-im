@@ -9,6 +9,8 @@ const ORIGIN = process.env.ORIGIN ?? 'http://127.0.0.1:16988'
 const ORGANIZATION = Number(process.env.ORGANIZATION ?? 1)
 const OTHER_ORGANIZATION = Number(process.env.OTHER_ORGANIZATION ?? 2)
 const FORGED_ORGANIZATION = 999999
+const UINT64_MAX = 18446744073709551615n
+const GROUP_ACCESS_PAGE_LIMIT = 100
 const RUN_ID = process.env.QA_RUN_ID ?? randomUUID().replaceAll('-', '').slice(0, 16)
 const MANIFEST_PATH = resolve(process.env.QA_MANIFEST ?? `/tmp/b8im-im-reliability-${RUN_ID}.json`)
 assert.match(RUN_ID, /^[a-z0-9][a-z0-9-]{7,39}$/, 'QA_RUN_ID must be an 8-40 character QA marker')
@@ -23,6 +25,13 @@ function traceIdOf(traceparent) {
   assert.notEqual(match[1], '0'.repeat(32), 'trace-id must be non-zero')
   assert.notEqual(match[2], '0'.repeat(16), 'parent-id must be non-zero')
   return match[1]
+}
+
+function positiveDecimal(value, label) {
+  assert.equal(typeof value, 'string', `${label} must be a string`)
+  assert.match(value, /^[1-9][0-9]{0,19}$/, `${label} must be a canonical positive decimal`)
+  assert.equal(BigInt(value) <= UINT64_MAX, true, `${label} exceeds uint64`)
+  return value
 }
 
 const SUCCESS_TRACEPARENT = process.env.B8IM_TRACEPARENT ?? newTraceparent()
@@ -43,7 +52,11 @@ const manifest = {
 }
 
 function qaClientMessageId(scenario) {
-  return `qa-im-${RUN_ID}-${scenario}-${randomUUID()}`
+  const suffix = randomBytes(8).toString('hex')
+  const prefix = 'qa-im-' + RUN_ID + '-'
+  const scenarioLimit = 80 - prefix.length - suffix.length - 1
+  assert.equal(scenarioLimit > 0, true, 'QA_RUN_ID leaves no room for a client_msg_id scenario')
+  return prefix + scenario.slice(0, scenarioLimit) + '-' + suffix
 }
 
 function recordMessage(scenario, acknowledgement, traceId = null) {
@@ -246,6 +259,82 @@ class Peer {
   }
 }
 
+async function completeGroupAccessSnapshot(peer, organization, authSnapshotId) {
+  let snapshotId = null
+  let cursor = null
+  for (let page = 0; page < 100; page += 1) {
+    const requestId = qaClientMessageId('group-access-' + page)
+    peer.send({
+      cmd: 'group_member_access_snapshot',
+      organization: FORGED_ORGANIZATION,
+      client_msg_id: requestId,
+      data: {
+        access_snapshot_id: snapshotId,
+        cursor,
+        limit: GROUP_ACCESS_PAGE_LIMIT
+      }
+    })
+    const acknowledgement = await peer.take(
+      (packet) => (packet.cmd === 'group_member_access_snapshot_ack' || packet.cmd === 'error')
+        && packet.client_msg_id === requestId,
+      'GROUP_MEMBER_ACCESS_SNAPSHOT_ACK'
+    )
+    assert.equal(
+      acknowledgement.cmd,
+      'group_member_access_snapshot_ack',
+      JSON.stringify(acknowledgement)
+    )
+    assert.equal(Number(acknowledgement.organization), organization)
+    assert.equal(acknowledgement.client_msg_id, requestId)
+    const data = acknowledgement.data ?? {}
+    assert.deepEqual(
+      Object.keys(data).sort(),
+      ['access_snapshot_id', 'entries', 'has_more', 'next_cursor'].sort(),
+      'GROUP_MEMBER_ACCESS_SNAPSHOT_ACK schema changed'
+    )
+    const pageSnapshotId = positiveDecimal(
+      data.access_snapshot_id,
+      'GROUP_MEMBER_ACCESS_SNAPSHOT_ACK access_snapshot_id'
+    )
+    if (snapshotId === null) {
+      assert.equal(
+        BigInt(pageSnapshotId) >= BigInt(authSnapshotId),
+        true,
+        'group access snapshot regressed behind AUTH_ACK'
+      )
+      snapshotId = pageSnapshotId
+    } else {
+      assert.equal(pageSnapshotId, snapshotId, 'group access snapshot changed within a page chain')
+    }
+    assert.ok(Array.isArray(data.entries), 'group access snapshot entries must be an array')
+    assert.equal(
+      data.entries.length <= GROUP_ACCESS_PAGE_LIMIT,
+      true,
+      'group access snapshot exceeded the requested page limit'
+    )
+    assert.equal(typeof data.has_more, 'boolean', 'group access snapshot has_more must be boolean')
+    if (!data.has_more) {
+      assert.equal(data.next_cursor, null, 'terminal group access snapshot page must clear cursor')
+      return snapshotId
+    }
+    assert.equal(
+      data.entries.length > 0,
+      true,
+      'non-terminal group access snapshot page must not be empty'
+    )
+    assert.equal(typeof data.next_cursor, 'string', 'group access snapshot continuation cursor missing')
+    assert.ok(data.next_cursor.length > 0, 'group access snapshot continuation cursor is empty')
+    assert.equal(
+      Buffer.byteLength(data.next_cursor, 'utf8') <= 512,
+      true,
+      'group access snapshot continuation cursor is too large'
+    )
+    assert.equal(data.next_cursor.includes('\0'), false, 'group access snapshot cursor contains NUL')
+    cursor = data.next_cursor
+  }
+  throw new Error('group access snapshot page limit exceeded')
+}
+
 async function authenticate(peer, organization, webToken, deviceId) {
   const challenge = await peer.take((packet) => packet.cmd === 'auth', 'AUTH challenge')
   assert.equal(Number(challenge.organization), 0)
@@ -279,7 +368,16 @@ async function authenticate(peer, organization, webToken, deviceId) {
   assert.equal(acknowledgement.data?.credential_session_id, claims.session_id)
   assert.match(String(acknowledgement.data?.session_id ?? ''), /^[a-f0-9]{32}$/)
   assert.equal(traceIdOf(acknowledgement.traceparent), authTraceId)
-  return authTraceId
+  const authSnapshotId = positiveDecimal(
+    acknowledgement.data?.access_snapshot_id,
+    'AUTH_ACK access_snapshot_id'
+  )
+  const accessSnapshotId = await completeGroupAccessSnapshot(
+    peer,
+    organization,
+    authSnapshotId
+  )
+  return { authTraceId, accessSnapshotId }
 }
 
 async function takeSendAcknowledgement(peer, clientMessageId, label) {
@@ -292,21 +390,32 @@ async function takeSendAcknowledgement(peer, clientMessageId, label) {
   return packet
 }
 
-async function syncFromZero(peer, organization, messageId) {
+async function syncFromZero(peer, organization, accessSnapshotId, messageId) {
   let cursor = '0'
   for (let page = 0; page < 100; page += 1) {
+    const requestId = qaClientMessageId('sync-' + page)
     peer.send({
       cmd: 'sync',
       organization: FORGED_ORGANIZATION,
-      data: { after_global_seq: cursor, limit: 100 }
+      client_msg_id: requestId,
+      data: {
+        after_global_seq: cursor,
+        access_snapshot_id: accessSnapshotId,
+        limit: 100
+      }
     })
     const acknowledgement = await peer.take(
-      (packet) => packet.cmd === 'sync_ack' || packet.cmd === 'error',
+      (packet) => (packet.cmd === 'sync_ack' || packet.cmd === 'error')
+        && packet.client_msg_id === requestId,
       'SYNC_ACK'
     )
     assert.equal(acknowledgement.cmd, 'sync_ack', JSON.stringify(acknowledgement))
+    assert.equal(acknowledgement.client_msg_id, requestId)
     assert.equal(Number(acknowledgement.organization), organization)
     assert.equal(acknowledgement.data?.scope, 'global')
+    assert.equal(acknowledgement.data?.access_snapshot_id, accessSnapshotId)
+    assert.ok(Array.isArray(acknowledgement.data?.messages), 'SYNC_ACK messages must be an array')
+    assert.equal(typeof acknowledgement.data?.has_more, 'boolean', 'SYNC_ACK has_more must be boolean')
     const found = acknowledgement.data.messages.find(
       (message) => message.message_id === messageId
     )
@@ -348,9 +457,11 @@ try {
   const alice = await new Peer('alice').open()
   const bob = await new Peer('bob').open()
   peers.push(alice, bob)
-  const authTraceId = await authenticate(alice, ORGANIZATION, sessionA.token, deviceA)
-  await authenticate(bob, ORGANIZATION, sessionB.token, deviceB)
-  manifest.auth_trace_id = authTraceId
+  const aliceAuth = await authenticate(alice, ORGANIZATION, sessionA.token, deviceA)
+  const bobAuth = await authenticate(bob, ORGANIZATION, sessionB.token, deviceB)
+  manifest.auth_trace_id = aliceAuth.authTraceId
+  manifest.alice_access_snapshot_id = aliceAuth.accessSnapshotId
+  manifest.bob_access_snapshot_id = bobAuth.accessSnapshotId
 
   let sameDeviceCoexist = false
   if (process.env.COEXIST_CHECK === '1') {
@@ -376,6 +487,7 @@ try {
     traceparent: SUCCESS_TRACEPARENT,
     data: {
       conversation_type: 1,
+      to_organization: ORGANIZATION,
       to_user_id: sessionB.userId,
       message_type: 1,
       content: { text: `[QA:${RUN_ID}] online delivery ${new Date().toISOString()}` }
@@ -426,15 +538,17 @@ try {
     'PUSH after duplicate SEND'
   )
 
+  const deliveredAckClientMessageId = qaClientMessageId('ack-delivered')
   bob.send({
     cmd: 'ack',
     organization: FORGED_ORGANIZATION,
+    client_msg_id: deliveredAckClientMessageId,
     data: { message_id: message.message_id, status: 'delivered' }
   })
   const [ackAcknowledgement, senderAck] = await Promise.all([
     bob.take(
-      (packet) => packet.cmd === 'ack_ack'
-        && packet.data?.message_id === message.message_id,
+      (packet) => (packet.cmd === 'ack_ack' || packet.cmd === 'error')
+        && packet.client_msg_id === deliveredAckClientMessageId,
       'ACK_ACK'
     ),
     alice.take(
@@ -443,19 +557,31 @@ try {
       'sender ACK'
     )
   ])
+  assert.equal(ackAcknowledgement.cmd, 'ack_ack', JSON.stringify(ackAcknowledgement))
+  assert.equal(ackAcknowledgement.client_msg_id, deliveredAckClientMessageId)
+  assert.equal(ackAcknowledgement.data?.client_msg_id, deliveredAckClientMessageId)
+  assert.equal(ackAcknowledgement.data?.request_client_msg_id, deliveredAckClientMessageId)
+  assert.equal(ackAcknowledgement.data?.message_id, message.message_id)
   assert.equal(ackAcknowledgement.data.status, 'delivered')
   assert.equal(Number(senderAck.organization), ORGANIZATION)
 
+  const duplicateAckClientMessageId = qaClientMessageId('ack-duplicate')
   bob.send({
     cmd: 'ack',
     organization: FORGED_ORGANIZATION,
+    client_msg_id: duplicateAckClientMessageId,
     data: { message_id: message.message_id, status: 'delivered' }
   })
   const duplicateAck = await bob.take(
-    (packet) => packet.cmd === 'ack_ack'
-      && packet.data?.message_id === message.message_id,
+    (packet) => (packet.cmd === 'ack_ack' || packet.cmd === 'error')
+      && packet.client_msg_id === duplicateAckClientMessageId,
     'duplicate ACK_ACK'
   )
+  assert.equal(duplicateAck.cmd, 'ack_ack', JSON.stringify(duplicateAck))
+  assert.equal(duplicateAck.client_msg_id, duplicateAckClientMessageId)
+  assert.equal(duplicateAck.data?.client_msg_id, duplicateAckClientMessageId)
+  assert.equal(duplicateAck.data?.request_client_msg_id, duplicateAckClientMessageId)
+  assert.equal(duplicateAck.data?.message_id, message.message_id)
   assert.equal(duplicateAck.data.status, 'delivered')
 
   let assetResult = null
@@ -469,6 +595,7 @@ try {
       client_msg_id: assetClientMessageId,
       data: {
         conversation_type: 1,
+        to_organization: ORGANIZATION,
         to_user_id: sessionB.userId,
         message_type: 2,
         content: { file_id: fileId }
@@ -502,6 +629,7 @@ try {
     traceparent: CROSS_TENANT_TRACEPARENT,
     data: {
       conversation_type: 1,
+      to_organization: OTHER_ORGANIZATION,
       to_user_id: otherSession.userId,
       message_type: 1,
       content: { text: `[QA:${RUN_ID}] cross-organization rejection probe` }
@@ -520,7 +648,11 @@ try {
     cmd: 'sync',
     organization: FORGED_ORGANIZATION,
     client_msg_id: invalidSyncId,
-    data: { after_global_seq: 0, limit: 20 }
+    data: {
+      after_global_seq: 0,
+      access_snapshot_id: bobAuth.accessSnapshotId,
+      limit: 20
+    }
   })
   const invalidSync = await bob.take(
     (packet) => packet.cmd === 'error' && packet.client_msg_id === invalidSyncId,
@@ -544,6 +676,7 @@ try {
       client_msg_id: offlineId,
       data: {
         conversation_type: 1,
+        to_organization: ORGANIZATION,
         to_user_id: sessionB.userId,
         message_type: 1,
         content: { text: `[QA:${RUN_ID}] offline recovery ${ordinal}` }
@@ -570,13 +703,25 @@ try {
 
   const reconnectedBob = await new Peer('bob-reconnect').open()
   peers.push(reconnectedBob)
-  await authenticate(reconnectedBob, ORGANIZATION, sessionB.token, deviceB)
-  const synced = await syncFromZero(reconnectedBob, ORGANIZATION, message.message_id)
+  const reconnectedBobAuth = await authenticate(
+    reconnectedBob,
+    ORGANIZATION,
+    sessionB.token,
+    deviceB
+  )
+  manifest.reconnected_bob_access_snapshot_id = reconnectedBobAuth.accessSnapshotId
+  const synced = await syncFromZero(
+    reconnectedBob,
+    ORGANIZATION,
+    reconnectedBobAuth.accessSnapshotId,
+    message.message_id
+  )
   assert.equal(synced.global_seq, message.global_seq)
   for (const offlineMessage of offlineMessages) {
     const recovered = await syncFromZero(
       reconnectedBob,
       ORGANIZATION,
+      reconnectedBobAuth.accessSnapshotId,
       offlineMessage.message_id
     )
     assert.equal(recovered.global_seq, offlineMessage.global_seq)
@@ -678,7 +823,7 @@ try {
     message_seq: message.message_seq,
     global_seq: message.global_seq,
     trace_id: SUCCESS_TRACE_ID,
-    auth_trace_id: authTraceId,
+    auth_trace_id: aliceAuth.authTraceId,
     cross_tenant_trace_id: CROSS_TENANT_TRACE_ID,
     cross_tenant_error: crossTenantError.data.code,
     invalid_sync_error: invalidSync.data.code,
